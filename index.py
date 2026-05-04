@@ -5,6 +5,9 @@ import re
 import io
 from typing import List, Dict, Any, Optional
 
+from parser_common import normalize_spaces, parse_italian_number, clean_description, deduplicate_items
+from parser_scan import build_scan_response
+
 app = FastAPI()
 
 app.add_middleware(
@@ -15,7 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-PARSER_VERSION = "generic-v2"
+PARSER_VERSION = "hybrid-v1"
 
 STOP_HINTS = [
     "metodo di pagamento",
@@ -61,38 +64,6 @@ PRODUCTS_BLOCK_RE = re.compile(
 )
 
 
-def normalize_spaces(text: str) -> str:
-    return re.sub(r"\s+", " ", str(text or "")).strip()
-
-
-def parse_italian_number(value: str) -> float:
-    text = normalize_spaces(value)
-    text = text.replace(".", "").replace(",", ".")
-    text = re.sub(r"[^\d\.\-]", "", text)
-    try:
-        return float(text)
-    except ValueError:
-        return 0.0
-
-
-def clean_description(value: str) -> str:
-    text = normalize_spaces(value)
-    text = re.sub(r"^[-–—\s]+", "", text)
-    text = re.sub(r"\bRICAMBIO\b$", "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r"\bRICAMBI\b$", "", text, flags=re.IGNORECASE).strip()
-    return text.strip()
-
-
-def should_ignore_item(description: str) -> bool:
-    low = clean_description(description).lower()
-    return any(h in low for h in IGNORE_DESCRIPTION_HINTS)
-
-
-def split_lines(text: str) -> List[str]:
-    text = text.replace("\r", "\n")
-    return [normalize_spaces(line) for line in text.split("\n") if normalize_spaces(line)]
-
-
 def extract_text_with_pdfplumber(file_bytes: bytes) -> str:
     pages_text = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -101,6 +72,11 @@ def extract_text_with_pdfplumber(file_bytes: bytes) -> str:
             if text.strip():
                 pages_text.append(text)
     return "\n".join(pages_text)
+
+
+def should_ignore_item(description: str) -> bool:
+    low = clean_description(description).lower()
+    return any(h in low for h in IGNORE_DESCRIPTION_HINTS)
 
 
 def score_item(item: Dict[str, Any]) -> bool:
@@ -155,60 +131,39 @@ def parse_textual_item_line(line: str) -> Optional[Dict[str, Any]]:
     """
     Gestisce righe tipo:
     10 VALVOLA SICUREZZA 1 PCE 44,180 € 44,18 € 22 % -
-    20 KIT CONVERSIONE GPL BALCONY GB122-24 K H 2 PCE 38,725 € 77,45 € 22 % -
     """
     original = normalize_spaces(line)
     if not original:
-        return None
+      return None
 
-    # deve iniziare con numero riga articolo
     if not re.match(r"^\d{1,4}\s+", original):
-        return None
+      return None
 
-    # taglia via l'eventuale coda IVA / natura dopo il secondo €
-    # teniamo comunque tutta la riga per il parsing da sinistra/destra
     parts = original.split()
     if len(parts) < 6:
-        return None
+      return None
 
-    pos = parts[0]
     rest = parts[1:]
-
-    # cerchiamo da destra i token utili: total, €, price, €, um, qty
-    # esempio:
-    # desc .... 1 PCE 44,180 € 44,18 € 22 % -
-    # noi vogliamo:
-    # qty = token prima di UM
-    # um = PCE
-    # price = token prima del primo €
-    # total = token prima del secondo €
     euro_positions = [i for i, tok in enumerate(rest) if tok == "€"]
+
     if len(euro_positions) < 2:
-        return None
+      return None
 
     first_euro = euro_positions[0]
     second_euro = euro_positions[1]
 
-    if first_euro < 2:
-        return None
-    if second_euro < 1:
-        return None
+    if first_euro < 3 or second_euro < 1:
+      return None
 
     price_token = rest[first_euro - 1]
     total_token = rest[second_euro - 1]
-
-    # prima del prezzo ci aspettiamo ... qty um price
-    if first_euro < 3:
-        return None
-
     um_token = rest[first_euro - 2]
     qty_token = rest[first_euro - 3]
-
     desc_tokens = rest[: first_euro - 3]
     desc = " ".join(desc_tokens).strip()
 
     if not desc:
-        return None
+      return None
 
     return {
         "code": "",
@@ -218,6 +173,11 @@ def parse_textual_item_line(line: str) -> Optional[Dict[str, Any]]:
         "price": parse_italian_number(price_token),
         "total": parse_italian_number(total_token),
     }
+
+
+def split_lines(text: str) -> List[str]:
+    text = text.replace("\r", "\n")
+    return [normalize_spaces(line) for line in text.split("\n") if normalize_spaces(line)]
 
 
 def parse_products_services_block(text: str) -> List[Dict[str, Any]]:
@@ -240,11 +200,9 @@ def parse_products_services_block(text: str) -> List[Dict[str, Any]]:
             current = None
             break
 
-        # salta intestazione tabella
         if "nr descrizione quantita" in low or "nr descrizione quantità" in low:
             continue
 
-        # prima prova Bosch tabellare multipagina
         item = parse_bosch_tabular_line(line)
         if item:
             if current and score_item(current):
@@ -252,7 +210,6 @@ def parse_products_services_block(text: str) -> List[Dict[str, Any]]:
             current = item
             continue
 
-        # poi prova righe testuali compatte
         item = parse_textual_item_line(line)
         if item:
             if current and score_item(current):
@@ -260,13 +217,11 @@ def parse_products_services_block(text: str) -> List[Dict[str, Any]]:
             current = item
             continue
 
-        # codice su riga separata
         code_match = CODE_VALUE_RE.search(line)
         if code_match and current:
             current["code"] = code_match.group(1)
             continue
 
-        # righe di rumore da non aggiungere
         if any(x in low for x in [
             "cod.tipo:",
             "tipo cess. prestazione",
@@ -277,7 +232,6 @@ def parse_products_services_block(text: str) -> List[Dict[str, Any]]:
         ]):
             continue
 
-        # descrizione spezzata su più righe
         if current and len(line) > 2:
             current["description"] = clean_description(
                 f"{current.get('description', '')} {line}"
@@ -358,27 +312,6 @@ def parse_whole_document(text: str) -> List[Dict[str, Any]]:
     return results
 
 
-def deduplicate_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    output = []
-
-    for item in items:
-        key = (
-            item.get("code", ""),
-            item.get("description", ""),
-            float(item.get("quantity", 0) or 0),
-            item.get("unit", ""),
-            float(item.get("price", 0) or 0),
-            float(item.get("total", 0) or 0),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        output.append(item)
-
-    return output
-
-
 def parse_invoice_items(text: str) -> List[Dict[str, Any]]:
     candidates = []
 
@@ -421,21 +354,17 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Errore lettura PDF: {e}")
 
     if not text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Documento senza testo estraibile. Probabile scansione: serve OCR o mappatura manuale."
-        )
+        return build_scan_response(file.filename)
 
     rows = parse_invoice_items(text)
 
     if not rows:
-        raise HTTPException(
-            status_code=400,
-            detail="Nessuna riga articolo riconosciuta nel PDF."
-        )
+        return build_scan_response(file.filename)
 
     return {
         "ok": True,
+        "mode": "text",
+        "scanDetected": False,
         "fileName": file.filename,
         "rows": rows,
         "matrix": [

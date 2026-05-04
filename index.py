@@ -15,11 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-HEADER_HINTS = [
-    "codice", "cod.", "cod prodotto", "cod. prodotto", "articolo",
-    "descrizione", "quantita", "quantità", "qta", "q.tà",
-    "um", "u.m.", "prezzo", "importo", "totale"
-]
+PARSER_VERSION = "generic-v2"
 
 STOP_HINTS = [
     "metodo di pagamento",
@@ -30,8 +26,6 @@ STOP_HINTS = [
     "totale documento",
     "totale iva",
     "netto a pagare",
-    "iban",
-    "swift",
 ]
 
 IGNORE_DESCRIPTION_HINTS = [
@@ -42,35 +36,8 @@ IGNORE_DESCRIPTION_HINTS = [
     "contributo ambientale",
 ]
 
-CODE_VALUE_RE = re.compile(
-    r"Cod\.valore:\s*([A-Z0-9\-/\.]+)",
-    re.IGNORECASE,
-)
+CODE_VALUE_RE = re.compile(r"Cod\.valore:\s*([A-Z0-9\-/\.]+)", re.IGNORECASE)
 
-# Riga compatta tipo:
-# 10 VALVOLA SICUREZZA 1 PCE 44,180 € 44,18 € 22 % -
-TEXTUAL_ITEM_RE = re.compile(
-    r"""
-    ^\s*
-    (?P<pos>\d{1,4})\s+
-    (?P<desc>.+?)
-    \s+
-    (?P<qty>\d+(?:[.,]\d+)?)
-    \s+
-    (?P<um>[A-Z]{1,4})
-    \s+
-    (?P<price>\d+(?:[.,]\d+)?)
-    \s+€
-    \s+
-    (?P<total>\d+(?:[.,]\d+)?)
-    \s+€
-    .*$
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# Riga tabellare tipo Bosch multipagina:
-# 0010 8-738-728-744 1 7,45 ... 4,95
 BOSCH_TABLE_RE = re.compile(
     r"""
     ^\s*
@@ -88,9 +55,18 @@ BOSCH_TABLE_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+PRODUCTS_BLOCK_RE = re.compile(
+    r"PRODOTTI E SERVIZI(.*?)(METODO DI PAGAMENTO|REGIME FISCALE|DATI AGGIUNTIVI|RIEPILOGO IVA|CALCOLO FATTURA)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def normalize_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
 
 def parse_italian_number(value: str) -> float:
-    text = str(value or "").strip()
+    text = normalize_spaces(value)
     text = text.replace(".", "").replace(",", ".")
     text = re.sub(r"[^\d\.\-]", "", text)
     try:
@@ -99,87 +75,22 @@ def parse_italian_number(value: str) -> float:
         return 0.0
 
 
-def normalize_spaces(text: str) -> str:
-    return re.sub(r"\s+", " ", str(text or "")).strip()
-
-
 def clean_description(value: str) -> str:
     text = normalize_spaces(value)
+    text = re.sub(r"^[-–—\s]+", "", text)
     text = re.sub(r"\bRICAMBIO\b$", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\bRICAMBI\b$", "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r"^[-–—\s]+", "", text)
     return text.strip()
-
-
-def looks_like_header(line: str) -> bool:
-    low = normalize_spaces(line).lower()
-    matches = sum(1 for hint in HEADER_HINTS if hint in low)
-    return matches >= 2
-
-
-def looks_like_stop_line(line: str) -> bool:
-    low = normalize_spaces(line).lower()
-    return any(hint in low for hint in STOP_HINTS)
-
-
-def looks_like_noise(line: str) -> bool:
-    low = normalize_spaces(line).lower()
-
-    if not low:
-        return True
-    if low.startswith("pagina "):
-        return True
-    if "robert bosch" in low:
-        return True
-    if "società unipersonale" in low:
-        return True
-    if "partita iva" in low:
-        return True
-    if "cl thermoservice" in low:
-        return True
-    if "www." in low:
-        return True
-    if "fattura nr." in low:
-        return True
-    if "nota di debito" in low and "nr." in low:
-        return True
-    return False
 
 
 def should_ignore_item(description: str) -> bool:
     low = clean_description(description).lower()
-    return any(hint in low for hint in IGNORE_DESCRIPTION_HINTS)
+    return any(h in low for h in IGNORE_DESCRIPTION_HINTS)
 
 
-def score_item(item: Dict[str, Any]) -> bool:
-    desc = clean_description(item.get("description", ""))
-    qty = float(item.get("quantity", 0) or 0)
-    price = float(item.get("price", 0) or 0)
-    total = float(item.get("total", 0) or 0)
-    code = normalize_spaces(item.get("code", ""))
-
-    if not desc:
-        return False
-    if should_ignore_item(desc):
-        return False
-    if qty <= 0:
-        return False
-    if price <= 0 and total <= 0:
-        return False
-    if code and len(code) < 3:
-        return False
-    return True
-
-
-def finalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "code": normalize_spaces(item.get("code", "")),
-        "description": clean_description(item.get("description", "")),
-        "quantity": item.get("quantity", 0) or 0,
-        "unit": normalize_spaces(item.get("unit", "PZ")) or "PZ",
-        "price": item.get("price", 0) or 0,
-        "total": item.get("total", 0) or 0,
-    }
+def split_lines(text: str) -> List[str]:
+    text = text.replace("\r", "\n")
+    return [normalize_spaces(line) for line in text.split("\n") if normalize_spaces(line)]
 
 
 def extract_text_with_pdfplumber(file_bytes: bytes) -> str:
@@ -192,88 +103,181 @@ def extract_text_with_pdfplumber(file_bytes: bytes) -> str:
     return "\n".join(pages_text)
 
 
-def split_lines(text: str) -> List[str]:
-    text = text.replace("\r", "\n")
-    lines = [normalize_spaces(line) for line in text.split("\n")]
-    return [line for line in lines if line]
+def score_item(item: Dict[str, Any]) -> bool:
+    desc = clean_description(item.get("description", ""))
+    qty = float(item.get("quantity", 0) or 0)
+    price = float(item.get("price", 0) or 0)
+    total = float(item.get("total", 0) or 0)
+
+    if not desc:
+        return False
+    if should_ignore_item(desc):
+        return False
+    if qty <= 0:
+        return False
+    if price <= 0 and total <= 0:
+        return False
+    return True
+
+
+def finalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "code": normalize_spaces(item.get("code", "")),
+        "description": clean_description(item.get("description", "")),
+        "quantity": float(item.get("quantity", 0) or 0),
+        "unit": normalize_spaces(item.get("unit", "PZ")) or "PZ",
+        "price": float(item.get("price", 0) or 0),
+        "total": float(item.get("total", 0) or 0),
+    }
+
+
+def looks_like_stop_line(line: str) -> bool:
+    low = normalize_spaces(line).lower()
+    return any(h in low for h in STOP_HINTS)
+
+
+def parse_bosch_tabular_line(line: str) -> Optional[Dict[str, Any]]:
+    m = BOSCH_TABLE_RE.match(line)
+    if not m:
+        return None
+
+    return {
+        "code": m.group("code"),
+        "description": "",
+        "quantity": parse_italian_number(m.group("qty")),
+        "unit": "PZ",
+        "price": parse_italian_number(m.group("price")),
+        "total": parse_italian_number(m.group("total")),
+    }
+
+
+def parse_textual_item_line(line: str) -> Optional[Dict[str, Any]]:
+    """
+    Gestisce righe tipo:
+    10 VALVOLA SICUREZZA 1 PCE 44,180 € 44,18 € 22 % -
+    20 KIT CONVERSIONE GPL BALCONY GB122-24 K H 2 PCE 38,725 € 77,45 € 22 % -
+    """
+    original = normalize_spaces(line)
+    if not original:
+        return None
+
+    # deve iniziare con numero riga articolo
+    if not re.match(r"^\d{1,4}\s+", original):
+        return None
+
+    # taglia via l'eventuale coda IVA / natura dopo il secondo €
+    # teniamo comunque tutta la riga per il parsing da sinistra/destra
+    parts = original.split()
+    if len(parts) < 6:
+        return None
+
+    pos = parts[0]
+    rest = parts[1:]
+
+    # cerchiamo da destra i token utili: total, €, price, €, um, qty
+    # esempio:
+    # desc .... 1 PCE 44,180 € 44,18 € 22 % -
+    # noi vogliamo:
+    # qty = token prima di UM
+    # um = PCE
+    # price = token prima del primo €
+    # total = token prima del secondo €
+    euro_positions = [i for i, tok in enumerate(rest) if tok == "€"]
+    if len(euro_positions) < 2:
+        return None
+
+    first_euro = euro_positions[0]
+    second_euro = euro_positions[1]
+
+    if first_euro < 2:
+        return None
+    if second_euro < 1:
+        return None
+
+    price_token = rest[first_euro - 1]
+    total_token = rest[second_euro - 1]
+
+    # prima del prezzo ci aspettiamo ... qty um price
+    if first_euro < 3:
+        return None
+
+    um_token = rest[first_euro - 2]
+    qty_token = rest[first_euro - 3]
+
+    desc_tokens = rest[: first_euro - 3]
+    desc = " ".join(desc_tokens).strip()
+
+    if not desc:
+        return None
+
+    return {
+        "code": "",
+        "description": desc,
+        "quantity": parse_italian_number(qty_token),
+        "unit": normalize_spaces(um_token).upper(),
+        "price": parse_italian_number(price_token),
+        "total": parse_italian_number(total_token),
+    }
 
 
 def parse_products_services_block(text: str) -> List[Dict[str, Any]]:
-    block_match = re.search(
-        r"PRODOTTI E SERVIZI(.*?)(METODO DI PAGAMENTO|REGIME FISCALE|DATI AGGIUNTIVI|RIEPILOGO IVA|CALCOLO FATTURA)",
-        text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if not block_match:
+    match = PRODUCTS_BLOCK_RE.search(text)
+    if not match:
         return []
 
-    block = block_match.group(1)
+    block = match.group(1)
     lines = split_lines(block)
-    return parse_lines_generic(lines)
 
-
-def parse_lines_generic(lines: List[str]) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
 
     for line in lines:
-        if looks_like_noise(line):
-            continue
-        if looks_like_header(line):
-            continue
+        low = line.lower()
+
         if looks_like_stop_line(line):
             if current and score_item(current):
                 results.append(finalize_item(current))
             current = None
             break
 
-        # Bosch tabella multipagina
-        bosch_match = BOSCH_TABLE_RE.match(line)
-        if bosch_match:
+        # salta intestazione tabella
+        if "nr descrizione quantita" in low or "nr descrizione quantità" in low:
+            continue
+
+        # prima prova Bosch tabellare multipagina
+        item = parse_bosch_tabular_line(line)
+        if item:
             if current and score_item(current):
                 results.append(finalize_item(current))
-
-            current = {
-                "code": bosch_match.group("code"),
-                "description": "",
-                "quantity": parse_italian_number(bosch_match.group("qty")),
-                "unit": "PZ",
-                "price": parse_italian_number(bosch_match.group("price")),
-                "total": parse_italian_number(bosch_match.group("total")),
-            }
+            current = item
             continue
 
-        # Riga compatta testuale
-        textual_match = TEXTUAL_ITEM_RE.match(line)
-        if textual_match:
+        # poi prova righe testuali compatte
+        item = parse_textual_item_line(line)
+        if item:
             if current and score_item(current):
                 results.append(finalize_item(current))
-
-            current = {
-                "code": "",
-                "description": textual_match.group("desc"),
-                "quantity": parse_italian_number(textual_match.group("qty")),
-                "unit": normalize_spaces(textual_match.group("um")).upper(),
-                "price": parse_italian_number(textual_match.group("price")),
-                "total": parse_italian_number(textual_match.group("total")),
-            }
+            current = item
             continue
 
-        # Riga codice separata
-        code_value_match = CODE_VALUE_RE.search(line)
-        if code_value_match and current:
-            current["code"] = code_value_match.group(1)
+        # codice su riga separata
+        code_match = CODE_VALUE_RE.search(line)
+        if code_match and current:
+            current["code"] = code_match.group(1)
             continue
 
-        # Rumore da non appendere alla descrizione
-        low = line.lower()
+        # righe di rumore da non aggiungere
         if any(x in low for x in [
-            "d.d.t.", "vs. ordine", "cessione norm.", "documenti correlati",
-            "tipo doc.", "numero doc.", "data doc.", "tipo cess. prestazione"
+            "cod.tipo:",
+            "tipo cess. prestazione",
+            "dati ordine",
+            "dati ddt",
+            "causale documento",
+            "documenti correlati",
         ]):
             continue
 
-        # Append descrizione su righe spezzate
+        # descrizione spezzata su più righe
         if current and len(line) > 2:
             current["description"] = clean_description(
                 f"{current.get('description', '')} {line}"
@@ -286,7 +290,72 @@ def parse_lines_generic(lines: List[str]) -> List[Dict[str, Any]]:
 
 
 def parse_whole_document(text: str) -> List[Dict[str, Any]]:
-    return parse_lines_generic(split_lines(text))
+    lines = split_lines(text)
+
+    results: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+
+    for line in lines:
+        low = line.lower()
+
+        if looks_like_stop_line(line):
+            if current and score_item(current):
+                results.append(finalize_item(current))
+            current = None
+            continue
+
+        if any(x in low for x in [
+            "robert bosch",
+            "società unipersonale",
+            "pagina ",
+            "partita iva",
+            "cl thermoservice",
+            "iban",
+            "swift",
+            "www.",
+        ]):
+            continue
+
+        item = parse_bosch_tabular_line(line)
+        if item:
+            if current and score_item(current):
+                results.append(finalize_item(current))
+            current = item
+            continue
+
+        item = parse_textual_item_line(line)
+        if item:
+            if current and score_item(current):
+                results.append(finalize_item(current))
+            current = item
+            continue
+
+        code_match = CODE_VALUE_RE.search(line)
+        if code_match and current:
+            current["code"] = code_match.group(1)
+            continue
+
+        if any(x in low for x in [
+            "d.d.t.",
+            "vs. ordine",
+            "cessione norm.",
+            "tipo cess. prestazione",
+            "cod.tipo:",
+            "documenti correlati",
+            "dati ordine",
+            "dati ddt",
+        ]):
+            continue
+
+        if current and len(line) > 2:
+            current["description"] = clean_description(
+                f"{current.get('description', '')} {line}"
+            )
+
+    if current and score_item(current):
+        results.append(finalize_item(current))
+
+    return results
 
 
 def deduplicate_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -330,7 +399,11 @@ def parse_invoice_items(text: str) -> List[Dict[str, Any]]:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "pdf-parser"}
+    return {
+        "ok": True,
+        "service": "pdf-parser",
+        "version": PARSER_VERSION,
+    }
 
 
 @app.post("/")

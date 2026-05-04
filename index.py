@@ -10,15 +10,23 @@ from parser_scan import build_scan_response
 
 app = FastAPI()
 
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "https://magazzino-pro.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-PARSER_VERSION = "hybrid-v1"
+PARSER_VERSION = "hybrid-v2"
 
 STOP_HINTS = [
     "metodo di pagamento",
@@ -128,32 +136,28 @@ def parse_bosch_tabular_line(line: str) -> Optional[Dict[str, Any]]:
 
 
 def parse_textual_item_line(line: str) -> Optional[Dict[str, Any]]:
-    """
-    Gestisce righe tipo:
-    10 VALVOLA SICUREZZA 1 PCE 44,180 € 44,18 € 22 % -
-    """
     original = normalize_spaces(line)
     if not original:
-      return None
+        return None
 
     if not re.match(r"^\d{1,4}\s+", original):
-      return None
+        return None
 
     parts = original.split()
     if len(parts) < 6:
-      return None
+        return None
 
     rest = parts[1:]
     euro_positions = [i for i, tok in enumerate(rest) if tok == "€"]
 
     if len(euro_positions) < 2:
-      return None
+        return None
 
     first_euro = euro_positions[0]
     second_euro = euro_positions[1]
 
     if first_euro < 3 or second_euro < 1:
-      return None
+        return None
 
     price_token = rest[first_euro - 1]
     total_token = rest[second_euro - 1]
@@ -163,7 +167,7 @@ def parse_textual_item_line(line: str) -> Optional[Dict[str, Any]]:
     desc = " ".join(desc_tokens).strip()
 
     if not desc:
-      return None
+        return None
 
     return {
         "code": "",
@@ -330,13 +334,18 @@ def parse_invoice_items(text: str) -> List[Dict[str, Any]]:
     return candidates[0]
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {
         "ok": True,
         "service": "pdf-parser",
         "version": PARSER_VERSION,
     }
+
+
+@app.api_route("/parse", methods=["POST", "OPTIONS"])
+async def parse_invoice_pdf_parse(file: UploadFile = File(...)):
+    return await parse_invoice_pdf(file)
 
 
 @app.post("/")

@@ -13,53 +13,93 @@ from parser_scan import build_scan_response
 
 app = FastAPI()
 
-# CORS aperto: il parser non usa cookie/sessioni, serve solo a ricevere il PDF dal frontend.
+
+# ============================================================
+# CORS
+# ============================================================
+
+ALLOWED_ORIGINS = [
+    "https://magazzino-pro.vercel.app",
+    "https://www.magazzino-pro.vercel.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=86400,
 )
 
 
+def build_cors_headers(request: Request | None = None) -> Dict[str, str]:
+    origin = ""
+
+    if request:
+        origin = request.headers.get("origin", "")
+
+    allowed_origin = "*"
+
+    if origin in ALLOWED_ORIGINS or origin.endswith(".vercel.app"):
+        allowed_origin = origin
+
+    return {
+        "Access-Control-Allow-Origin": allowed_origin,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Max-Age": "86400",
+        "Vary": "Origin",
+    }
+
+
 @app.middleware("http")
-async def add_cors_headers(request: Request, call_next):
+async def force_cors_headers(request: Request, call_next):
     if request.method == "OPTIONS":
         return JSONResponse(
             content={"ok": True},
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                "Access-Control-Allow-Headers": "*",
-                "Access-Control-Max-Age": "86400",
-            },
+            status_code=200,
+            headers=build_cors_headers(request),
         )
 
     response = await call_next(request)
 
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Expose-Headers"] = "*"
+    for key, value in build_cors_headers(request).items():
+        response.headers[key] = value
 
     return response
 
 
-@app.options("/{full_path:path}")
-async def preflight_handler(full_path: str, request: Request):
+@app.options("/")
+async def options_root(request: Request):
     return JSONResponse(
         content={"ok": True},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": request.headers.get(
-                "access-control-request-headers", "*"
-            ),
-            "Access-Control-Max-Age": "86400",
-        },
+        status_code=200,
+        headers=build_cors_headers(request),
+    )
+
+
+@app.options("/parse")
+async def options_parse(request: Request):
+    return JSONResponse(
+        content={"ok": True},
+        status_code=200,
+        headers=build_cors_headers(request),
+    )
+
+
+@app.options("/{full_path:path}")
+async def options_any(full_path: str, request: Request):
+    return JSONResponse(
+        content={"ok": True},
+        status_code=200,
+        headers=build_cors_headers(request),
     )
 
 
@@ -69,13 +109,16 @@ def root():
         "ok": True,
         "service": "pdf-parser-python",
         "status": "running",
-        "allowed_origins": ["*"],
+        "allowed_origins": ALLOWED_ORIGINS,
     }
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "status": "running"}
+    return {
+        "ok": True,
+        "status": "running",
+    }
 
 
 @app.post("/parse")
@@ -157,6 +200,10 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
             },
         )
 
+
+# ============================================================
+# PDF TEXT EXTRACTION
+# ============================================================
 
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> Dict[str, str]:
     with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as tmp:
@@ -244,9 +291,6 @@ def extract_invoice_rows(text: str) -> List[Dict[str, Any]]:
 
 # ============================================================
 # BOSCH CLASSICO
-# Formato:
-# 0010 8-718-641-615-0 1 56,45 -30,00%(c) -5,00%(d) 37,53 H6
-# descrizione nella riga successiva.
 # ============================================================
 
 def extract_bosch_classic_rows(text: str) -> List[Dict[str, Any]]:
@@ -367,13 +411,7 @@ def parse_bosch_classic_product_line(line: str):
 
 
 # ============================================================
-# FATTURA ELETTRONICA / ARUBA / ARISTON / BOSCH ELETTRONICA
-# Formati:
-# 1 GRUPPO RITORNO 1 ST 75,98000000 € 75,98 € 22 % -
-# Cod.tipo: COD_FORNITORE, Cod.valore: 65105322
-#
-# 10 VALVOLA SICUREZZA 1 PCE 44,180 € 44,18 € 22 % -
-# Cod.tipo: SAP Material Number, Cod.valore: 87167632110
+# FATTURA ELETTRONICA
 # ============================================================
 
 def extract_electronic_invoice_rows(text: str) -> List[Dict[str, Any]]:
@@ -451,11 +489,8 @@ def parse_electronic_product_line(line: str):
     value = normalize_spaces(value)
 
     patterns = [
-        # 1 GRUPPO RITORNO 1 ST 75,98000000 € 75,98 € 22 % -
         r"^(?P<row>\d{1,5})\s+(?P<desc>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>[A-Z]{1,8})\s+(?P<price>\d+(?:[.,]\d+)?)\s*€?\s+(?P<total>\d+(?:[.,]\d+)?)\s*€?\s+(?P<iva>\d{1,2})\s*%",
-        # 10 VALVOLA SICUREZZA 1 PCE 44,180 € 44,18 € 22 % -
         r"^(?P<row>\d{1,5})\s+(?P<desc>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>[A-Z]{1,8})\s+(?P<price>\d+(?:[.,]\d+)?)\s*€?\s+(?P<total>\d+(?:[.,]\d+)?)",
-        # 50 Addebito trasporto 1 15,000 € 15,00 € 22 % -
         r"^(?P<row>\d{1,5})\s+(?P<desc>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<price>\d+(?:[.,]\d+)?)\s*€?\s+(?P<total>\d+(?:[.,]\d+)?)\s*€?\s+(?P<iva>\d{1,2})\s*%",
     ]
 
@@ -467,7 +502,6 @@ def parse_electronic_product_line(line: str):
 
         row_number = match.groupdict().get("row", "")
         description = clean_description(match.groupdict().get("desc", ""))
-
         unit = match.groupdict().get("unit", "") or "ST"
 
         item = {

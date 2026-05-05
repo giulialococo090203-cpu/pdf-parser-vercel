@@ -21,6 +21,8 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:4173",
 ]
 
+PARSER_MODE = "bosch-line-tracking-v8"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -53,7 +55,7 @@ def root():
         "ok": True,
         "service": "pdf-parser-python",
         "status": "running",
-        "mode": "traceability-parser-v7",
+        "mode": PARSER_MODE,
         "allowed_origins": ALLOWED_ORIGINS,
     }
 
@@ -63,7 +65,7 @@ def health():
     return {
         "ok": True,
         "status": "running",
-        "mode": "traceability-parser-v7",
+        "mode": PARSER_MODE,
     }
 
 
@@ -82,10 +84,11 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
     try:
         extracted = extract_text_from_pdf_bytes(file_bytes)
 
-        full_text = normalize_pdf_text(
+        primary_text = normalize_pdf_text(extracted.get("text", ""))
+
+        fallback_text = normalize_pdf_text(
             "\n".join(
                 [
-                    extracted.get("text", ""),
                     extracted.get("layoutText", ""),
                     extracted.get("tableText", ""),
                     extracted.get("wordText", ""),
@@ -93,12 +96,18 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
             )
         )
 
+        # Importante:
+        # usa prima il testo naturale del PDF.
+        # I testi layout/table/word servono solo se il testo naturale è vuoto,
+        # perché unirli tutti insieme può duplicare righe e creare falsi componenti.
+        full_text = primary_text if primary_text.strip() else fallback_text
+
         if not full_text.strip():
             scan = build_scan_response(filename)
             scan["text"] = ""
             scan["rawText"] = ""
             scan["debug"] = {
-                "mode": "traceability-parser-v7",
+                "mode": PARSER_MODE,
                 "reason": "empty_pdf_text",
                 "textLength": 0,
                 "preview": "",
@@ -106,7 +115,6 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
             return scan
 
         rows = extract_invoice_rows(full_text)
-        rows = deduplicate_items(rows)
         rows = final_cleanup_rows(rows)
 
         if not rows:
@@ -120,10 +128,10 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
                 "text": full_text,
                 "rawText": full_text,
                 "debug": {
-                    "mode": "traceability-parser-v7",
+                    "mode": PARSER_MODE,
                     "textLength": len(full_text),
                     "preview": full_text[:15000],
-                    "lines": full_text.split("\n")[:600],
+                    "lines": full_text.split("\n")[:700],
                 },
             }
 
@@ -135,7 +143,7 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
             "text": full_text,
             "rawText": full_text,
             "debug": {
-                "mode": "traceability-parser-v7",
+                "mode": PARSER_MODE,
                 "textLength": len(full_text),
                 "rowsFound": len(rows),
                 "codes": [row.get("code") for row in rows],
@@ -224,6 +232,7 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> Dict[str, str]:
                                 for cell in row
                                 if normalize_spaces(cell)
                             ]
+
                             if cells:
                                 table_texts.append(" ".join(cells))
                 except Exception:
@@ -290,7 +299,7 @@ def join_words_as_line(words: List[Dict[str, Any]]) -> str:
 
 
 # ============================================================
-# RISPOSTA MATRIX
+# MATRIX RISPOSTA
 # ============================================================
 
 def build_matrix(rows: List[Dict[str, Any]]) -> List[List[Any]]:
@@ -338,12 +347,15 @@ def extract_invoice_rows(text: str) -> List[Dict[str, Any]]:
 
     candidates = []
 
-    # Sequenza: prima parser più affidabile, poi fallback.
+    # Prima Bosch: è il formato più strutturato e più importante.
     candidates.extend(parse_bosch_invoice_rows(lines))
+
+    # Poi fattura elettronica generica.
     candidates.extend(parse_electronic_invoice_rows(product_lines))
+
+    # Infine fallback generico molto filtrato.
     candidates.extend(parse_generic_structured_rows(product_lines))
 
-    # Selezione: mantieni solo voci vere.
     candidates = [finalize_item(item) for item in candidates]
     candidates = [
         item
@@ -351,7 +363,6 @@ def extract_invoice_rows(text: str) -> List[Dict[str, Any]]:
         if is_valid_material(item) and not should_skip_item(item)
     ]
 
-    # Deduplica finale.
     return merge_and_deduplicate(candidates)
 
 
@@ -389,26 +400,16 @@ def parse_bosch_invoice_rows(lines: List[str]) -> List[Dict[str, Any]]:
     for index, line in enumerate(lines):
         value = normalize_spaces(line)
 
-        if is_hard_document_line(value):
-            continue
-
         parsed = parse_bosch_commercial_line(value)
 
         if not parsed:
             continue
 
         code = parsed["code"]
-        description = clean_joined_description(parsed.get("description", ""))
-
-        if not is_good_material_description(description):
-            description = find_bosch_description(lines, index, code)
-
+        description = find_bosch_description_strict(lines, index)
         description = clean_joined_description(description)
 
         if not is_good_material_description(description):
-            continue
-
-        if normalize_key(description) == normalize_key(code):
             continue
 
         quantity = safe_number(parsed.get("quantity", 0))
@@ -447,16 +448,16 @@ def parse_bosch_commercial_line(line: str) -> Optional[Dict[str, Any]]:
     code_pattern = r"(?P<code>[0-9]-[0-9]{3}-[0-9]{3}-[0-9]{3}(?:-[0-9])?)"
 
     patterns = [
-        # 0010 8-738-724-555 1 12,30 -30,00%(c) -5,00%(d) 8,18
+        # 0010 8-738-724-555 1 42,80 -30,00%(c) -5,00%(d) 28,46
         rf"^(?P<row>\d{{3,5}})\s+{code_pattern}\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<list_price>\d+(?:[.,]\d+)?)(?P<middle>(?:\s+[-+]?\d+(?:[.,]\d+)?%\(?[a-z]?\)?|\s+[-+]?\d+(?:[.,]\d+)?%|\s+[A-Z]{{1,4}})*)\s+(?P<total>\d+(?:[.,]\d+)?)(?:\s+(?P<tail>.*))?$",
 
-        # 0010 8-738-724-555 1 ST 12,30 8,18
+        # 0010 8-738-724-555 1 ST 42,80 28,46
         rf"^(?P<row>\d{{3,5}})\s+{code_pattern}\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>[A-Z]{{1,8}})\s+(?P<list_price>\d+(?:[.,]\d+)?)\s+(?P<total>\d+(?:[.,]\d+)?)(?:\s+(?P<tail>.*))?$",
 
-        # 0010 8-738-724-555 CAVO DEL SENSORE 1 ST 12,30 8,18
+        # 0010 8-738-724-555 CAVO DEL SENSORE 1 ST 42,80 28,46
         rf"^(?P<row>\d{{3,5}})\s+{code_pattern}\s+(?P<desc>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>[A-Z]{{1,8}})\s+(?P<list_price>\d+(?:[.,]\d+)?)\s+(?P<total>\d+(?:[.,]\d+)?)$",
 
-        # 8-738-724-555 CAVO DEL SENSORE 1 ST 12,30 8,18
+        # 8-738-724-555 CAVO DEL SENSORE 1 ST 42,80 28,46
         rf"^{code_pattern}\s+(?P<desc>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>[A-Z]{{1,8}})\s+(?P<list_price>\d+(?:[.,]\d+)?)\s+(?P<total>\d+(?:[.,]\d+)?)$",
     ]
 
@@ -475,7 +476,6 @@ def parse_bosch_commercial_line(line: str) -> Optional[Dict[str, Any]]:
         row_number = groups.get("row", "")
         tail = groups.get("tail", "") or ""
         desc = groups.get("desc", "") or ""
-
         possible_description = clean_joined_description(desc or tail)
 
         return {
@@ -491,9 +491,9 @@ def parse_bosch_commercial_line(line: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def find_bosch_description(lines: List[str], index: int, code: str) -> str:
-    # Descrizione sotto la riga commerciale.
-    for offset in range(1, 8):
+def find_bosch_description_strict(lines: List[str], index: int) -> str:
+    # Nelle Bosch la descrizione reale è quasi sempre subito sotto la riga commerciale.
+    for offset in range(1, 7):
         pos = index + offset
 
         if pos >= len(lines):
@@ -504,19 +504,38 @@ def find_bosch_description(lines: List[str], index: int, code: str) -> str:
         if not value:
             continue
 
+        # Se arriva una nuova riga articolo, la descrizione non è stata trovata.
         if parse_bosch_commercial_line(value):
             break
 
+        # Se arriva un altro codice Bosch, non è descrizione.
         if contains_bosch_code(value):
+            break
+
+        # Righe tecniche da ignorare, ma senza interrompere.
+        if re.match(r"^(RICAMBIO|RICAMBI)$", value, re.IGNORECASE):
             continue
 
+        if re.match(r"^old\s+[0-9A-Z._/\-]+$", value, re.IGNORECASE):
+            continue
+
+        if re.match(r"^OLD\s+[0-9A-Z._/\-]+$", value, re.IGNORECASE):
+            continue
+
+        if re.match(r"^D\.d\.T\.", value, re.IGNORECASE):
+            continue
+
+        # Righe amministrative: qui ci si ferma.
         if is_hard_document_line(value):
-            continue
+            break
 
-        if is_discount_or_price_line(value):
-            continue
+        if is_document_boundary(value):
+            break
 
         if is_transport_or_fee_line(value):
+            break
+
+        if is_discount_or_price_line(value):
             continue
 
         cleaned = clean_joined_description(value)
@@ -524,40 +543,18 @@ def find_bosch_description(lines: List[str], index: int, code: str) -> str:
         if is_good_material_description(cleaned):
             return cleaned
 
-    # Descrizione sopra la riga commerciale.
-    for offset in range(1, 5):
-        pos = index - offset
-
-        if pos < 0:
-            break
-
-        value = normalize_spaces(lines[pos])
-
-        if not value:
-            continue
-
-        if parse_bosch_commercial_line(value):
-            break
-
-        if contains_bosch_code(value):
-            continue
-
-        if is_hard_document_line(value):
-            continue
-
-        if is_discount_or_price_line(value):
-            continue
-
-        if is_transport_or_fee_line(value):
-            continue
-
-        cleaned = clean_joined_description(value)
-
-        if is_good_material_description(cleaned):
-            return cleaned
-
+    # Fallback: descrizione nella stessa riga.
     current = normalize_spaces(lines[index])
-    return extract_description_from_same_line(current, code)
+    same_line_description = extract_description_from_same_line(
+        current,
+        parse_bosch_commercial_line(current).get("code", "") if parse_bosch_commercial_line(current) else "",
+    )
+    same_line_description = clean_joined_description(same_line_description)
+
+    if is_good_material_description(same_line_description):
+        return same_line_description
+
+    return ""
 
 
 # ============================================================
@@ -764,6 +761,9 @@ def is_hard_document_line(line: str) -> bool:
 
     hard_patterns = [
         r"^NR\s+DESCRIZIONE",
+        r"^Pos\s+Cod\.",
+        r"^Descrizione\s+in\s+EUR",
+        r"^Cod\.EAN",
         r"^PRODOTTI\s+E\s+SERVIZI$",
         r"^Cod\.tipo",
         r"^Tipo dato",
@@ -794,15 +794,20 @@ def is_hard_document_line(line: str) -> bool:
         r"^DATI TRASPORTO",
         r"^INFORMAZIONI RESA",
         r"^ROBERT\s+BOSCH",
+        r"^Robert\s+Bosch",
         r"^BOSCH\s+S\.?P\.?A",
+        r"^Capitale\s+",
         r"^CAPITALE\s+SOCIALE",
         r"^REGISTRO\s+IMPRESE",
         r"^SEDE\s+LEGALE",
         r"^PARTITA\s+IVA",
+        r"^Partita\s+IVA",
         r"^CODICE\s+FISCALE",
+        r"^Codice\s+Fiscale",
         r"^C\.?C\.?I\.?A\.?A",
         r"^R\.?E\.?A\.?",
         r"^ISCRITTA\s+TRIBUN",
+        r"^Iscritta\s+Tribun",
         r"^TRIBUNALE",
         r"^CAMERA\s+DI\s+COMMERCIO",
         r"^IT-\d{5}\b",
@@ -812,12 +817,29 @@ def is_hard_document_line(line: str) -> bool:
         r"^NAPOLI\b",
         r"^TORINO\b",
         r"^VIA\b",
+        r"^Via\b",
         r"^PIAZZA\b",
+        r"^P\.zza\b",
         r"^Totale\b",
         r"^Imponibile\b",
         r"^Bollo\b",
         r"^Bollo\s+assolto",
         r"^Marca\s+da\s+bollo",
+        r"^Dati\s+da\s+indicare",
+        r"^Dest\.",
+        r"^Fattura$",
+        r"^Ns\. codice",
+        r"^presso\s+ILN",
+        r"^Cod\.Cliente",
+        r"^CL\s+THERMOSERVICE",
+        r"^INDICARE\s+SEMPRE",
+        r"^IL\s+RITARDATO",
+        r"^COMPORTERA",
+        r"^Informazioni\s+sulle",
+        r"^regolamento\s+REACH",
+        r"^www\.",
+        r"^Ricevuta\s+a",
+        r"^\(c\)=",
     ]
 
     return any(re.search(pattern, value, re.IGNORECASE) for pattern in hard_patterns)
@@ -828,7 +850,7 @@ def is_document_boundary(line: str) -> bool:
 
     return bool(
         re.search(
-            r"\b(METODO\s+DI\s+PAGAMENTO|REGIME\s+FISCALE|DATI\s+AGGIUNTIVI|RIEPILOGO\s+IVA|CALCOLO\s+FATTURA|SCADENZE|TOTALE\s+DOCUMENTO|NETTO\s+A\s+PAGARE|DOCUMENTI\s+CORRELATI|ALLEGATI|DATI\s+TRASPORTO)\b",
+            r"\b(METODO\s+DI\s+PAGAMENTO|REGIME\s+FISCALE|DATI\s+AGGIUNTIVI|RIEPILOGO\s+IVA|CALCOLO\s+FATTURA|SCADENZE|TOTALE\s+DOCUMENTO|NETTO\s+A\s+PAGARE|DOCUMENTI\s+CORRELATI|ALLEGATI|DATI\s+TRASPORTO|IVA\s+Descrizione)\b",
             value,
             re.IGNORECASE,
         )
@@ -856,7 +878,7 @@ def is_discount_or_price_line(line: str) -> bool:
 
     if re.search(r"%\s*\([a-z]\)", value, re.IGNORECASE):
         cleaned = re.sub(r"%\s*\([a-z]\)", "", value, flags=re.IGNORECASE)
-        cleaned = re.sub(r"[-+\d\s.,%()]+", "", cleaned).strip()
+        cleaned = re.sub(r"[-+\d\s.,%()=]+", "", cleaned).strip()
 
         if not cleaned:
             return True
@@ -929,6 +951,13 @@ def is_bad_description(description: str) -> bool:
         r"\bbollo\b",
         r"\bbollo\s+assolto\b",
         r"\bmarca\s+da\s+bollo\b",
+        r"\bcontributo\s+ambientale\b",
+        r"\bconai\b",
+        r"\bricevuta\s+a\b",
+        r"\bbonifici\b",
+        r"\bpagamenti\b",
+        r"\binteressi\b",
+        r"\bregolamento\s+reach\b",
     ]
 
     return any(re.search(pattern, value, re.IGNORECASE) for pattern in bad)
@@ -1113,13 +1142,21 @@ def merge_and_deduplicate(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by_key = {}
 
     for item in items:
+        row_number = str(item.get("rowNumber", "") or "").strip()
         code_key = normalize_key(item.get("code", ""))
         desc_key = normalize_key(item.get("description", ""))
+        quantity_key = str(item.get("quantity", ""))
+        total_key = str(item.get("total", ""))
 
-        if code_key:
-            key = f"code:{code_key}"
+        # Fondamentale:
+        # non deduplicare solo per codice, perché una fattura può avere lo stesso codice su più righe.
+        # Esempio reale: 8-738-722-108 appare a 0050 e 0080.
+        if row_number and code_key:
+            key = f"row:{row_number}:code:{code_key}"
+        elif code_key:
+            key = f"code:{code_key}:qty:{quantity_key}:total:{total_key}:desc:{desc_key}"
         else:
-            key = f"desc:{desc_key}"
+            key = f"desc:{desc_key}:qty:{quantity_key}:total:{total_key}"
 
         existing = by_key.get(key)
 

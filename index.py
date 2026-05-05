@@ -5,7 +5,7 @@ from typing import List, Dict, Any
 import pdfplumber
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from parser_common import parse_italian_number, clean_description, deduplicate_items
 from parser_scan import build_scan_response
@@ -15,22 +15,20 @@ app = FastAPI()
 
 
 # ============================================================
-# CORS
+# CORS - VERSIONE APERTA PER VERCEL / PRODUZIONE
 # ============================================================
 
-ALLOWED_ORIGINS = [
-    "https://magazzino-pro.vercel.app",
-    "https://www.magazzino-pro.vercel.app",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:4173",
-    "http://127.0.0.1:4173",
-]
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Max-Age": "86400",
+}
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -39,86 +37,57 @@ app.add_middleware(
 )
 
 
-def build_cors_headers(request: Request | None = None) -> Dict[str, str]:
-    origin = ""
-
-    if request:
-        origin = request.headers.get("origin", "")
-
-    allowed_origin = "*"
-
-    if origin in ALLOWED_ORIGINS or origin.endswith(".vercel.app"):
-        allowed_origin = origin
-
-    return {
-        "Access-Control-Allow-Origin": allowed_origin,
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-        "Access-Control-Max-Age": "86400",
-        "Vary": "Origin",
-    }
-
-
 @app.middleware("http")
-async def force_cors_headers(request: Request, call_next):
+async def cors_everywhere(request: Request, call_next):
     if request.method == "OPTIONS":
-        return JSONResponse(
-            content={"ok": True},
-            status_code=200,
-            headers=build_cors_headers(request),
-        )
+        return Response(status_code=204, headers=CORS_HEADERS)
 
     response = await call_next(request)
 
-    for key, value in build_cors_headers(request).items():
+    for key, value in CORS_HEADERS.items():
         response.headers[key] = value
 
     return response
 
 
 @app.options("/")
-async def options_root(request: Request):
-    return JSONResponse(
-        content={"ok": True},
-        status_code=200,
-        headers=build_cors_headers(request),
-    )
+async def options_root():
+    return Response(status_code=204, headers=CORS_HEADERS)
 
 
 @app.options("/parse")
-async def options_parse(request: Request):
-    return JSONResponse(
-        content={"ok": True},
-        status_code=200,
-        headers=build_cors_headers(request),
-    )
+async def options_parse():
+    return Response(status_code=204, headers=CORS_HEADERS)
 
 
 @app.options("/{full_path:path}")
-async def options_any(full_path: str, request: Request):
-    return JSONResponse(
-        content={"ok": True},
-        status_code=200,
-        headers=build_cors_headers(request),
-    )
+async def options_any(full_path: str):
+    return Response(status_code=204, headers=CORS_HEADERS)
 
 
 @app.get("/")
 def root():
-    return {
-        "ok": True,
-        "service": "pdf-parser-python",
-        "status": "running",
-        "allowed_origins": ALLOWED_ORIGINS,
-    }
+    return JSONResponse(
+        content={
+            "ok": True,
+            "service": "pdf-parser-python",
+            "status": "running",
+            "cors": "open",
+        },
+        headers=CORS_HEADERS,
+    )
 
 
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "status": "running",
-    }
+    return JSONResponse(
+        content={
+            "ok": True,
+            "status": "running",
+            "cors": "open",
+        },
+        headers=CORS_HEADERS,
+    )
 
 
 @app.post("/parse")
@@ -148,40 +117,47 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
                 "textLength": 0,
                 "preview": "",
             }
-            return scan
+
+            return JSONResponse(content=scan, headers=CORS_HEADERS)
 
         rows = extract_invoice_rows(full_text)
         rows = deduplicate_items(rows)
 
         if not rows:
-            return {
-                "ok": False,
+            return JSONResponse(
+                content={
+                    "ok": False,
+                    "fileName": filename,
+                    "error": "Il PDF è stato letto, ma non sono state riconosciute righe articolo utilizzabili.",
+                    "message": "Il PDF è stato letto, ma non sono state riconosciute righe articolo utilizzabili.",
+                    "rows": [],
+                    "matrix": [],
+                    "text": full_text,
+                    "rawText": full_text,
+                    "debug": {
+                        "textLength": len(full_text),
+                        "preview": full_text[:5000],
+                    },
+                },
+                headers=CORS_HEADERS,
+            )
+
+        return JSONResponse(
+            content={
+                "ok": True,
                 "fileName": filename,
-                "error": "Il PDF è stato letto, ma non sono state riconosciute righe articolo utilizzabili.",
-                "message": "Il PDF è stato letto, ma non sono state riconosciute righe articolo utilizzabili.",
-                "rows": [],
-                "matrix": [],
+                "rows": rows,
+                "matrix": build_matrix(rows),
                 "text": full_text,
                 "rawText": full_text,
                 "debug": {
                     "textLength": len(full_text),
-                    "preview": full_text[:5000],
+                    "rowsFound": len(rows),
+                    "preview": full_text[:1500],
                 },
-            }
-
-        return {
-            "ok": True,
-            "fileName": filename,
-            "rows": rows,
-            "matrix": build_matrix(rows),
-            "text": full_text,
-            "rawText": full_text,
-            "debug": {
-                "textLength": len(full_text),
-                "rowsFound": len(rows),
-                "preview": full_text[:1500],
             },
-        }
+            headers=CORS_HEADERS,
+        )
 
     except Exception as exc:
         message = str(exc) or "Errore interno durante il parsing PDF."
@@ -198,6 +174,7 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
                 "text": "",
                 "rawText": "",
             },
+            headers=CORS_HEADERS,
         )
 
 
@@ -234,6 +211,7 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> Dict[str, str]:
                                 for cell in row
                                 if normalize_spaces(cell)
                             ]
+
                             if cleaned:
                                 table_texts.append(" ".join(cleaned))
                 except Exception:
@@ -411,7 +389,7 @@ def parse_bosch_classic_product_line(line: str):
 
 
 # ============================================================
-# FATTURA ELETTRONICA
+# FATTURA ELETTRONICA / GENERICA
 # ============================================================
 
 def extract_electronic_invoice_rows(text: str) -> List[Dict[str, Any]]:
@@ -609,10 +587,6 @@ def is_electronic_continuation_line(line: str) -> bool:
 
     return not any(re.search(pattern, value, re.IGNORECASE) for pattern in blocked)
 
-
-# ============================================================
-# GENERIC FALLBACK
-# ============================================================
 
 def extract_generic_invoice_rows(text: str) -> List[Dict[str, Any]]:
     lines = [

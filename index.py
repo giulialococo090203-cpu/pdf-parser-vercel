@@ -97,7 +97,7 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
                 "matrix": [],
                 "debug": {
                     "textLength": len(text),
-                    "preview": text[:2000],
+                    "preview": text[:2500],
                 },
             }
 
@@ -169,6 +169,11 @@ def build_matrix(rows: List[Dict[str, Any]]) -> List[List[Any]]:
 
 def extract_invoice_rows(text: str) -> List[Dict[str, Any]]:
     normalized = normalize_pdf_text(text)
+
+    bosch_rows = extract_bosch_rows(normalized)
+    if bosch_rows:
+        return bosch_rows
+
     section = extract_products_section(normalized)
 
     lines = [
@@ -213,6 +218,114 @@ def extract_invoice_rows(text: str) -> List[Dict[str, Any]]:
     ]
 
 
+def extract_bosch_rows(text: str) -> List[Dict[str, Any]]:
+    lines = [
+        line.strip()
+        for line in str(text or "").split("\n")
+        if line and line.strip()
+    ]
+
+    results = []
+    pending = None
+
+    for line in lines:
+        value = re.sub(r"\s+", " ", line).strip()
+
+        product_match = re.match(
+            r"^(\d{4})\s+([0-9A-Z][0-9A-Z\-./]+)\s+(\d+(?:[.,]\d+)?)\s+(\d+(?:[.,]\d+)?)\s+(?:[-+]?\d+(?:[.,]\d+)?%\([a-z]\)\s+)*(?:(?:[-+]?\d+(?:[.,]\d+)?%)\s+)*(\d+(?:[.,]\d+)?)$",
+            value,
+            re.IGNORECASE,
+        )
+
+        if product_match:
+            pending = {
+                "rowNumber": product_match.group(1),
+                "code": product_match.group(2),
+                "quantity": parse_italian_number(product_match.group(3)),
+                "list_price": parse_italian_number(product_match.group(4)),
+                "total": parse_italian_number(product_match.group(5)),
+                "description": "",
+                "unit": "ST",
+            }
+            continue
+
+        if pending and is_bosch_description_line(value):
+            pending["description"] = clean_description(value)
+            quantity = float(pending.get("quantity", 0) or 0)
+            total = float(pending.get("total", 0) or 0)
+            price = total / quantity if quantity > 0 else float(pending.get("list_price", 0) or 0)
+
+            results.append(
+                finalize_item(
+                    {
+                        "code": pending.get("code", ""),
+                        "description": pending.get("description", ""),
+                        "quantity": quantity,
+                        "unit": pending.get("unit", "ST"),
+                        "price": price,
+                        "total": total,
+                    }
+                )
+            )
+            pending = None
+            continue
+
+    return [
+        item
+        for item in results
+        if item.get("code") and item.get("description") and float(item.get("quantity", 0) or 0) > 0
+    ]
+
+
+def is_bosch_description_line(line: str) -> bool:
+    value = str(line or "").strip()
+
+    if not value:
+        return False
+
+    ignored = [
+        r"^RICAMBIO$",
+        r"^Fattura$",
+        r"^Cod\.Cliente",
+        r"^Robert Bosch",
+        r"^Via ",
+        r"^Dati da indicare",
+        r"^Dest\.",
+        r"^Fattura presso",
+        r"^CL THERMOSERVICE",
+        r"^VIA ",
+        r"^IT-\d+",
+        r"^Pagina ",
+        r"^Pos Cod\.",
+        r"^Descrizione ",
+        r"^Cod\.EAN",
+        r"^Partita IVA",
+        r"^D\.d\.T\.",
+        r"^Vs\. ordine",
+        r"^del \d",
+        r"^Cessione ",
+        r"^ROBERT BOSCH",
+        r"^Capitale ",
+        r"^C\.C\.I\.A\.A\.",
+        r"^Bollo ",
+        r"^Pile ",
+        r"^BOSCH ",
+        r"^\d+[,.]\d+$",
+        r"^\d{4}\s+",
+    ]
+
+    if any(re.search(pattern, value, re.IGNORECASE) for pattern in ignored):
+        return False
+
+    if len(value) < 3:
+        return False
+
+    if not re.search(r"[A-ZÀ-Ü]", value, re.IGNORECASE):
+        return False
+
+    return True
+
+
 def normalize_pdf_text(text: str) -> str:
     value = str(text or "")
     value = value.replace("\r", "")
@@ -238,13 +351,8 @@ def parse_product_line(line: str):
     clean_line = re.sub(r"\s+", " ", str(line or "")).strip()
 
     patterns = [
-        # 1 GRUPPO RITORNO 1 ST 75,98000000 € 75,98 € 22 % -
         r"^(\d+)\s+(.+?)\s+(\d+(?:[.,]\d+)?)\s+([A-Z]{1,8})\s+(\d+(?:[.,]\d+)?)\s*€?\s+(\d+(?:[.,]\d+)?)\s*€?",
-
-        # 1 GRUPPO RITORNO ST 1 75,98000000 75,98
         r"^(\d+)\s+(.+?)\s+([A-Z]{1,8})\s+(\d+(?:[.,]\d+)?)\s+(\d+(?:[.,]\d+)?)\s+(\d+(?:[.,]\d+)?)",
-
-        # 1 GRUPPO RITORNO 1 ST 75,98000000
         r"^(\d+)\s+(.+?)\s+(\d+(?:[.,]\d+)?)\s+([A-Z]{1,8})\s+(\d+(?:[.,]\d+)?)",
     ]
 

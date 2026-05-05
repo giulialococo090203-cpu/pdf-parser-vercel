@@ -40,12 +40,17 @@ def clean_description(value: str) -> str:
         flags=re.IGNORECASE,
     )
 
+    # Rimuove residui tecnici frequenti
+    text = re.sub(r"\bPILE\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bAEE\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bRICAMBIO\b$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bRICAMBI\b$", "", text, flags=re.IGNORECASE)
+
     # Pulizia finale
-    text = re.sub(r"\bRICAMBIO\b$", "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r"\bRICAMBI\b$", "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r"\s*,\s*$", "", text)
+    text = re.sub(r"\s*,\s*", " ", text)
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"^[-–—,\s]+", "", text)
+    text = re.sub(r"[-–—,\s]+$", "", text)
 
     return text.strip()
 
@@ -62,8 +67,10 @@ def deduplicate_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             float(item.get("price", 0) or 0),
             float(item.get("total", 0) or 0),
         )
+
         if key in seen:
             continue
+
         seen.add(key)
         output.append(item)
 

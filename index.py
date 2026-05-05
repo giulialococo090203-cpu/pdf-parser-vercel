@@ -40,7 +40,7 @@ async def preflight_handler(full_path: str, request: Request):
 def root():
     return {
         "ok": True,
-        "service": "pdf-parser",
+        "service": "pdf-parser-python",
         "allowed_origins": ALLOWED_ORIGINS,
     }
 
@@ -62,9 +62,6 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
 
     if not file_bytes:
         raise HTTPException(status_code=400, detail="File vuoto.")
-
-    # TODO: qui va reinserita la tua logica reale del parser PDF.
-    # Per ora questa risposta serve solo per verificare che CORS e upload funzionino.
 
     return {
         "ok": True,

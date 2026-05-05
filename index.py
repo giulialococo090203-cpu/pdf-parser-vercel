@@ -4,8 +4,7 @@ from typing import List, Dict, Any
 
 import pdfplumber
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 
 from parser_common import parse_italian_number, clean_description, deduplicate_items
 from parser_scan import build_scan_response
@@ -13,34 +12,23 @@ from parser_scan import build_scan_response
 
 app = FastAPI()
 
-
-# ============================================================
-# CORS - VERSIONE APERTA PER VERCEL / PRODUZIONE
-# ============================================================
-
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "*",
+    "Access-Control-Expose-Headers": "*",
     "Access-Control-Max-Age": "86400",
 }
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=86400,
-)
-
-
 @app.middleware("http")
-async def cors_everywhere(request: Request, call_next):
+async def force_cors_headers(request: Request, call_next):
     if request.method == "OPTIONS":
-        return Response(status_code=204, headers=CORS_HEADERS)
+        return JSONResponse(
+            content={"ok": True},
+            status_code=200,
+            headers=CORS_HEADERS,
+        )
 
     response = await call_next(request)
 
@@ -50,44 +38,28 @@ async def cors_everywhere(request: Request, call_next):
     return response
 
 
-@app.options("/")
-async def options_root():
-    return Response(status_code=204, headers=CORS_HEADERS)
-
-
-@app.options("/parse")
-async def options_parse():
-    return Response(status_code=204, headers=CORS_HEADERS)
-
-
 @app.options("/{full_path:path}")
-async def options_any(full_path: str):
-    return Response(status_code=204, headers=CORS_HEADERS)
+async def preflight_handler(full_path: str, request: Request):
+    return JSONResponse(
+        content={"ok": True},
+        status_code=200,
+        headers=CORS_HEADERS,
+    )
 
 
 @app.get("/")
 def root():
-    return JSONResponse(
-        content={
-            "ok": True,
-            "service": "pdf-parser-python",
-            "status": "running",
-            "cors": "open",
-        },
-        headers=CORS_HEADERS,
-    )
+    return {
+        "ok": True,
+        "service": "pdf-parser-python",
+        "status": "running",
+        "cors": "forced",
+    }
 
 
 @app.get("/health")
 def health():
-    return JSONResponse(
-        content={
-            "ok": True,
-            "status": "running",
-            "cors": "open",
-        },
-        headers=CORS_HEADERS,
-    )
+    return {"ok": True, "status": "running"}
 
 
 @app.post("/parse")
@@ -117,47 +89,44 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
                 "textLength": 0,
                 "preview": "",
             }
-
             return JSONResponse(content=scan, headers=CORS_HEADERS)
 
         rows = extract_invoice_rows(full_text)
         rows = deduplicate_items(rows)
 
         if not rows:
-            return JSONResponse(
-                content={
-                    "ok": False,
-                    "fileName": filename,
-                    "error": "Il PDF è stato letto, ma non sono state riconosciute righe articolo utilizzabili.",
-                    "message": "Il PDF è stato letto, ma non sono state riconosciute righe articolo utilizzabili.",
-                    "rows": [],
-                    "matrix": [],
-                    "text": full_text,
-                    "rawText": full_text,
-                    "debug": {
-                        "textLength": len(full_text),
-                        "preview": full_text[:5000],
-                    },
-                },
-                headers=CORS_HEADERS,
-            )
-
-        return JSONResponse(
-            content={
-                "ok": True,
+            payload = {
+                "ok": False,
                 "fileName": filename,
-                "rows": rows,
-                "matrix": build_matrix(rows),
+                "error": "Il PDF è stato letto, ma non sono state riconosciute righe articolo utilizzabili.",
+                "message": "Il PDF è stato letto, ma non sono state riconosciute righe articolo utilizzabili.",
+                "rows": [],
+                "matrix": [],
                 "text": full_text,
                 "rawText": full_text,
                 "debug": {
                     "textLength": len(full_text),
-                    "rowsFound": len(rows),
-                    "preview": full_text[:1500],
+                    "preview": full_text[:5000],
                 },
+            }
+
+            return JSONResponse(content=payload, headers=CORS_HEADERS)
+
+        payload = {
+            "ok": True,
+            "fileName": filename,
+            "rows": rows,
+            "matrix": build_matrix(rows),
+            "text": full_text,
+            "rawText": full_text,
+            "debug": {
+                "textLength": len(full_text),
+                "rowsFound": len(rows),
+                "preview": full_text[:1500],
             },
-            headers=CORS_HEADERS,
-        )
+        }
+
+        return JSONResponse(content=payload, headers=CORS_HEADERS)
 
     except Exception as exc:
         message = str(exc) or "Errore interno durante il parsing PDF."
@@ -177,10 +146,6 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
             headers=CORS_HEADERS,
         )
 
-
-# ============================================================
-# PDF TEXT EXTRACTION
-# ============================================================
 
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> Dict[str, str]:
     with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as tmp:
@@ -211,7 +176,6 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> Dict[str, str]:
                                 for cell in row
                                 if normalize_spaces(cell)
                             ]
-
                             if cleaned:
                                 table_texts.append(" ".join(cleaned))
                 except Exception:
@@ -269,6 +233,9 @@ def extract_invoice_rows(text: str) -> List[Dict[str, Any]]:
 
 # ============================================================
 # BOSCH CLASSICO
+# Formato:
+# 0010 8-718-641-615-0 1 56,45 -30,00%(c) -5,00%(d) 37,53 H6
+# descrizione nella riga successiva.
 # ============================================================
 
 def extract_bosch_classic_rows(text: str) -> List[Dict[str, Any]]:
@@ -389,7 +356,13 @@ def parse_bosch_classic_product_line(line: str):
 
 
 # ============================================================
-# FATTURA ELETTRONICA / GENERICA
+# FATTURA ELETTRONICA / ARUBA / ARISTON / BOSCH ELETTRONICA
+# Formati:
+# 1 GRUPPO RITORNO 1 ST 75,98000000 € 75,98 € 22 % -
+# Cod.tipo: COD_FORNITORE, Cod.valore: 65105322
+#
+# 10 VALVOLA SICUREZZA 1 PCE 44,180 € 44,18 € 22 % -
+# Cod.tipo: SAP Material Number, Cod.valore: 87167632110
 # ============================================================
 
 def extract_electronic_invoice_rows(text: str) -> List[Dict[str, Any]]:
@@ -467,8 +440,11 @@ def parse_electronic_product_line(line: str):
     value = normalize_spaces(value)
 
     patterns = [
+        # 1 GRUPPO RITORNO 1 ST 75,98000000 € 75,98 € 22 % -
         r"^(?P<row>\d{1,5})\s+(?P<desc>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>[A-Z]{1,8})\s+(?P<price>\d+(?:[.,]\d+)?)\s*€?\s+(?P<total>\d+(?:[.,]\d+)?)\s*€?\s+(?P<iva>\d{1,2})\s*%",
+        # 10 VALVOLA SICUREZZA 1 PCE 44,180 € 44,18 € 22 % -
         r"^(?P<row>\d{1,5})\s+(?P<desc>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>[A-Z]{1,8})\s+(?P<price>\d+(?:[.,]\d+)?)\s*€?\s+(?P<total>\d+(?:[.,]\d+)?)",
+        # 50 Addebito trasporto 1 15,000 € 15,00 € 22 % -
         r"^(?P<row>\d{1,5})\s+(?P<desc>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<price>\d+(?:[.,]\d+)?)\s*€?\s+(?P<total>\d+(?:[.,]\d+)?)\s*€?\s+(?P<iva>\d{1,2})\s*%",
     ]
 
@@ -480,6 +456,7 @@ def parse_electronic_product_line(line: str):
 
         row_number = match.groupdict().get("row", "")
         description = clean_description(match.groupdict().get("desc", ""))
+
         unit = match.groupdict().get("unit", "") or "ST"
 
         item = {
@@ -587,6 +564,10 @@ def is_electronic_continuation_line(line: str) -> bool:
 
     return not any(re.search(pattern, value, re.IGNORECASE) for pattern in blocked)
 
+
+# ============================================================
+# GENERIC FALLBACK
+# ============================================================
 
 def extract_generic_invoice_rows(text: str) -> List[Dict[str, Any]]:
     lines = [

@@ -120,7 +120,7 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
             "debug": {
                 "textLength": len(full_text),
                 "rowsFound": len(rows),
-                "preview": full_text[:1200],
+                "preview": full_text[:1500],
             },
         }
 
@@ -214,9 +214,9 @@ def extract_invoice_rows(text: str) -> List[Dict[str, Any]]:
     normalized = normalize_pdf_text(text)
 
     extractors = [
-        extract_bosch_classic_rows,
-        extract_bosch_flexible_rows,
+        extract_bosch_rows,
         extract_aruba_invoice_rows,
+        extract_generic_invoice_rows,
     ]
 
     for extractor in extractors:
@@ -227,7 +227,17 @@ def extract_invoice_rows(text: str) -> List[Dict[str, Any]]:
     return []
 
 
-def extract_bosch_flexible_rows(text: str) -> List[Dict[str, Any]]:
+# ============================================================
+# BOSCH PARSER
+# Prende righe del tipo:
+# 0010 8-718-641-615-0 1 56,45 -30,00%(c) -5,00%(d) 37,53 H6
+# descrizione nella riga sotto.
+#
+# Gestisce anche:
+# 0300 8-738-400-425 30 1,91-100,00%(e) 0,00 IC
+# ============================================================
+
+def extract_bosch_rows(text: str) -> List[Dict[str, Any]]:
     lines = [
         normalize_spaces(line)
         for line in str(text or "").split("\n")
@@ -236,64 +246,57 @@ def extract_bosch_flexible_rows(text: str) -> List[Dict[str, Any]]:
 
     results = []
 
-    product_pattern = re.compile(
-        r"^(\d{3,5})\s+"
-        r"([0-9A-Z](?:[0-9A-Z]*[-./]){1,}[0-9A-Z]+)\s+"
-        r"(\d+(?:[.,]\d+)?)\s+"
-        r"(\d+(?:[.,]\d+)?)"
-        r"(?:\s+[-+]?\d+(?:[.,]\d+)?%\([a-z]\))*"
-        r"(?:\s+[-+]?\d+(?:[.,]\d+)?%)*"
-        r"\s+(\d+(?:[.,]\d+)?)"
-        r"(?:\s+([A-Z]{1,4}))?"
-        r".*$",
-        re.IGNORECASE,
-    )
-
     for index, line in enumerate(lines):
-        match = product_pattern.match(line)
+        parsed_line = parse_bosch_product_line(line)
 
-        if not match:
-            continue
-
-        code = match.group(2).strip()
-        quantity = parse_italian_number(match.group(3))
-        list_price = parse_italian_number(match.group(4))
-        total = parse_italian_number(match.group(5))
-        unit = match.group(6) or "ST"
-
-        if quantity <= 0:
+        if not parsed_line:
             continue
 
         description_parts = []
 
-        same_line_description = extract_description_from_bosch_product_line(line, match.end())
-        if same_line_description:
+        same_line_description = parsed_line.get("inlineDescription", "")
+        if same_line_description and is_good_description_line(same_line_description):
             description_parts.append(same_line_description)
 
-        for next_index in range(index + 1, min(index + 8, len(lines))):
-            next_line = lines[next_index]
+        for next_index in range(index + 1, min(index + 9, len(lines))):
+            next_line = normalize_spaces(lines[next_index])
 
-            if product_pattern.match(next_line):
+            if parse_bosch_product_line(next_line):
                 break
 
-            if is_bosch_description_line(next_line):
+            if is_document_boundary_line(next_line):
+                break
+
+            if is_old_code_line(next_line):
+                continue
+
+            if is_transport_or_fee_line(next_line):
+                break
+
+            if is_good_description_line(next_line):
                 description_parts.append(next_line)
                 continue
 
             if description_parts:
                 break
 
-        description = clean_description(" ".join(description_parts))
-        description = clean_bosch_description(description)
+        description = clean_bosch_description(" ".join(description_parts))
+
+        if not description:
+            description = parsed_line.get("code", "")
+
+        quantity = safe_number(parsed_line.get("quantity", 0))
+        total = safe_number(parsed_line.get("total", 0))
+        list_price = safe_number(parsed_line.get("listPrice", 0))
 
         price = total / quantity if quantity > 0 and total > 0 else list_price
 
         item = finalize_item(
             {
-                "code": code,
-                "description": description or code,
+                "code": parsed_line.get("code", ""),
+                "description": description,
                 "quantity": quantity,
-                "unit": unit,
+                "unit": parsed_line.get("unit", "ST"),
                 "price": price,
                 "total": total,
                 "brand": "Bosch",
@@ -306,87 +309,189 @@ def extract_bosch_flexible_rows(text: str) -> List[Dict[str, Any]]:
     return results
 
 
-def extract_description_from_bosch_product_line(line: str, start_index: int) -> str:
-    tail = normalize_spaces(line[start_index:])
+def parse_bosch_product_line(line: str):
+    value = normalize_spaces(line)
 
-    if not tail:
-        return ""
+    if not value:
+        return None
 
-    tail = re.sub(r"^[-+]?\d+(?:[.,]\d+)?%\([a-z]\)\s*", "", tail, flags=re.IGNORECASE)
-    tail = re.sub(r"^[-+]?\d+(?:[.,]\d+)?%\s*", "", tail, flags=re.IGNORECASE)
-    tail = re.sub(r"^\d+(?:[.,]\d+)?\s*", "", tail)
-    tail = clean_bosch_description(tail)
+    if is_noise_line(value):
+        return None
 
-    if is_noise_line(tail):
-        return ""
+    # Normalizza casi tipo:
+    # 1,91-100,00%(e)
+    value = re.sub(
+        r"(\d+[,.]\d+)([-+]\d+[,.]\d+%)",
+        r"\1 \2",
+        value,
+    )
 
-    return tail
+    # Regex robusta:
+    # posizione, codice Bosch, quantità, prezzo listino, eventuali sconti, importo netto, iva, descrizione eventuale
+    pattern = re.compile(
+        r"^"
+        r"(?P<pos>\d{3,5})\s+"
+        r"(?P<code>[0-9A-Z](?:[0-9A-Z]*[-./]){1,}[0-9A-Z]+)\s+"
+        r"(?P<qty>\d+(?:[.,]\d+)?)\s+"
+        r"(?P<list_price>\d+(?:[.,]\d+)?)"
+        r"(?P<middle>(?:\s*[-+]?\d+(?:[.,]\d+)?%\([a-z]\)|\s*[-+]?\d+(?:[.,]\d+)?%)*)\s+"
+        r"(?P<total>\d+(?:[.,]\d+)?)\s*"
+        r"(?P<vat>[A-Z][A-Z0-9]?)?"
+        r"(?:\s+(?P<tail>.*))?"
+        r"$",
+        re.IGNORECASE,
+    )
+
+    match = pattern.match(value)
+
+    if not match:
+        return None
+
+    return {
+        "rowNumber": match.group("pos"),
+        "code": match.group("code").strip(),
+        "quantity": parse_italian_number(match.group("qty")),
+        "listPrice": parse_italian_number(match.group("list_price")),
+        "total": parse_italian_number(match.group("total")),
+        "unit": match.group("vat") or "ST",
+        "inlineDescription": clean_bosch_description(match.group("tail") or ""),
+    }
 
 
-def extract_bosch_classic_rows(text: str) -> List[Dict[str, Any]]:
-    lines = [
-        normalize_spaces(line)
-        for line in str(text or "").split("\n")
-        if normalize_spaces(line)
-    ]
+def clean_bosch_description(value: str) -> str:
+    text = normalize_spaces(value)
 
-    results = []
-    pending = None
+    text = re.sub(r"\bRICAMBIO\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bRICAMBI\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bSOLAR\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bOLD\s+[0-9A-Z./_-]+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bold\s+[0-9A-Z./_-]+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bD\.d\.T\..*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bVs\. ordine.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bCessione Norm\..*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bAddebito Trasporto.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bContributo Ambientale.*$", "", text, flags=re.IGNORECASE)
 
-    for line in lines:
-        value = normalize_spaces(line)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"^[-–—,\s]+", "", text)
+    text = re.sub(r"[-–—,\s]+$", "", text)
 
-        product_match = re.match(
-            r"^(\d{3,5})\s+"
-            r"([0-9A-Z](?:[0-9A-Z]*[-./]){1,}[0-9A-Z]+)\s+"
-            r"(\d+(?:[.,]\d+)?)\s+"
-            r"(\d+(?:[.,]\d+)?)\s+"
-            r"(?:[-+]?\d+(?:[.,]\d+)?%\([a-z]\)\s+)*"
-            r"(?:[-+]?\d+(?:[.,]\d+)?%\s+)*"
-            r"(\d+(?:[.,]\d+)?)"
-            r"(?:\s+([A-Z]{1,4}))?"
-            r"$",
-            value,
+    return text.strip()
+
+
+def is_old_code_line(line: str) -> bool:
+    return bool(
+        re.search(
+            r"^\s*(old|OLD)\s+[0-9A-Z./_-]+",
+            str(line or ""),
             re.IGNORECASE,
         )
+    )
 
-        if product_match:
-            pending = {
-                "rowNumber": product_match.group(1),
-                "code": product_match.group(2),
-                "quantity": parse_italian_number(product_match.group(3)),
-                "list_price": parse_italian_number(product_match.group(4)),
-                "total": parse_italian_number(product_match.group(5)),
-                "description": "",
-                "unit": product_match.group(6) or "ST",
-                "brand": "Bosch",
-            }
-            continue
 
-        if pending and is_bosch_description_line(value):
-            quantity = float(pending.get("quantity", 0) or 0)
-            total = float(pending.get("total", 0) or 0)
-            price = total / quantity if quantity > 0 and total > 0 else float(pending.get("list_price", 0) or 0)
+def is_transport_or_fee_line(line: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(addebito\s+trasporto|trasporto|contributo\s+ambientale|conai|bollo)\b",
+            str(line or ""),
+            re.IGNORECASE,
+        )
+    )
 
-            item = finalize_item(
-                {
-                    "code": pending.get("code", ""),
-                    "description": clean_bosch_description(value),
-                    "quantity": quantity,
-                    "unit": pending.get("unit", "ST"),
-                    "price": price,
-                    "total": total,
-                    "brand": "Bosch",
-                }
-            )
 
-            if is_valid_material(item):
-                results.append(item)
+def is_document_boundary_line(line: str) -> bool:
+    value = normalize_spaces(line)
 
-            pending = None
+    patterns = [
+        r"^ROBERT BOSCH",
+        r"^Robert Bosch",
+        r"^Capitale ",
+        r"^C\.C\.I\.A\.A\.",
+        r"^Bollo ",
+        r"^BOSCH ",
+        r"^Dati da indicare",
+        r"^Dest\.",
+        r"^Fattura$",
+        r"^Ns\. codice",
+        r"^presso ILN",
+        r"^Pagina ",
+        r"^Cod\.Cliente",
+        r"^IVA ",
+        r"^Ricevuta ",
+        r"^Il documento",
+        r"^Per eventuali bonifici",
+        r"^UniCredit",
+        r"^IBAN",
+        r"^SWIFT",
+        r"^INDICARE SEMPRE",
+        r"^IL RITARDATO",
+        r"^Informazioni sulle Sostanze",
+    ]
 
-    return results
+    return any(re.search(pattern, value, re.IGNORECASE) for pattern in patterns)
 
+
+def is_noise_line(line: str) -> bool:
+    value = normalize_spaces(line)
+
+    if not value:
+        return True
+
+    if is_document_boundary_line(value):
+        return True
+
+    if is_transport_or_fee_line(value):
+        return True
+
+    patterns = [
+        r"^RICAMBIO$",
+        r"^RICAMBI$",
+        r"^SOLAR$",
+        r"^Pos\s+Cod\.",
+        r"^Descrizione ",
+        r"^Cod\.EAN",
+        r"^Partita IVA",
+        r"^D\.d\.T\.",
+        r"^Vs\. ordine",
+        r"^del \d",
+        r"^Cessione ",
+        r"^CL THERMOSERVICE",
+        r"^VIA ",
+        r"^Via ",
+        r"^IT-\d+",
+        r"^\d+[,.]\d+$",
+    ]
+
+    return any(re.search(pattern, value, re.IGNORECASE) for pattern in patterns)
+
+
+def is_good_description_line(line: str) -> bool:
+    value = clean_bosch_description(line)
+
+    if not value:
+        return False
+
+    if is_noise_line(value):
+        return False
+
+    if parse_bosch_product_line(value):
+        return False
+
+    if is_old_code_line(value):
+        return False
+
+    if re.search(r"^\d+(?:[.,]\d+)?$", value):
+        return False
+
+    if re.search(r"^\d{3,5}\s+", value):
+        return False
+
+    return bool(re.search(r"[A-ZÀ-Üa-zà-ü]", value))
+
+
+# ============================================================
+# ARUBA / FATTURA ELETTRONICA PARSER
+# ============================================================
 
 def extract_aruba_invoice_rows(text: str) -> List[Dict[str, Any]]:
     section = extract_products_section(text)
@@ -480,6 +585,91 @@ def parse_aruba_product_line(line: str):
     return None
 
 
+# ============================================================
+# GENERIC FALLBACK PARSER
+# Utile per fatture non Bosch con righe articolo simili.
+# ============================================================
+
+def extract_generic_invoice_rows(text: str) -> List[Dict[str, Any]]:
+    lines = [
+        normalize_spaces(line)
+        for line in str(text or "").split("\n")
+        if normalize_spaces(line)
+    ]
+
+    results = []
+
+    for index, line in enumerate(lines):
+        if is_noise_line(line):
+            continue
+
+        parsed = parse_generic_product_line(line)
+
+        if not parsed:
+            continue
+
+        description = parsed.get("description", "")
+
+        if not description:
+            for next_index in range(index + 1, min(index + 5, len(lines))):
+                next_line = lines[next_index]
+
+                if parse_generic_product_line(next_line):
+                    break
+
+                if is_good_description_line(next_line):
+                    description = next_line
+                    break
+
+        item = finalize_item(
+            {
+                "code": parsed.get("code", ""),
+                "description": description,
+                "quantity": parsed.get("quantity", 0),
+                "unit": parsed.get("unit", "ST"),
+                "price": parsed.get("price", 0),
+                "total": parsed.get("total", 0),
+            }
+        )
+
+        if is_valid_material(item):
+            results.append(item)
+
+    return results
+
+
+def parse_generic_product_line(line: str):
+    value = normalize_spaces(line)
+
+    # Esempio generico:
+    # 10 CODICE-123 DESCRIZIONE 2 PZ 15,50 31,00
+    patterns = [
+        r"^(?P<pos>\d{1,5})\s+(?P<code>[A-Z0-9][A-Z0-9._/\-]{3,})\s+(?P<desc>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>[A-Z]{1,8})\s+(?P<price>\d+(?:[.,]\d+)?)\s+(?P<total>\d+(?:[.,]\d+)?)",
+        r"^(?P<pos>\d{1,5})\s+(?P<code>[A-Z0-9][A-Z0-9._/\-]{3,})\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<price>\d+(?:[.,]\d+)?)\s+(?P<total>\d+(?:[.,]\d+)?)",
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, value, re.IGNORECASE)
+
+        if not match:
+            continue
+
+        return {
+            "code": match.groupdict().get("code", ""),
+            "description": clean_description(match.groupdict().get("desc", "")),
+            "quantity": parse_italian_number(match.groupdict().get("qty", "0")),
+            "unit": match.groupdict().get("unit", "ST") or "ST",
+            "price": parse_italian_number(match.groupdict().get("price", "0")),
+            "total": parse_italian_number(match.groupdict().get("total", "0")),
+        }
+
+    return None
+
+
+# ============================================================
+# UTILS
+# ============================================================
+
 def normalize_pdf_text(text: str) -> str:
     value = str(text or "")
     value = value.replace("\r", "")
@@ -490,96 +680,6 @@ def normalize_pdf_text(text: str) -> str:
 
 def normalize_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
-
-
-def clean_bosch_description(value: str) -> str:
-    text = normalize_spaces(value)
-
-    text = re.sub(r"\bRICAMBIO\b", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bRICAMBI\b", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bSOLAR\b", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bOLD\s+[0-9A-Z./_-]+", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bold\s+[0-9A-Z./_-]+", "", text)
-    text = re.sub(r"\bD\.d\.T\..*$", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bVs\. ordine.*$", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bCessione Norm\..*$", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bAddebito Trasporto.*$", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bContributo Ambientale.*$", "", text, flags=re.IGNORECASE)
-
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"^[-–—,\s]+", "", text)
-    text = re.sub(r"[-–—,\s]+$", "", text)
-
-    return text.strip()
-
-
-def is_noise_line(line: str) -> bool:
-    value = normalize_spaces(line)
-
-    if not value:
-        return True
-
-    patterns = [
-        r"^RICAMBIO$",
-        r"^RICAMBI$",
-        r"^SOLAR$",
-        r"^Fattura$",
-        r"^Cod\.Cliente",
-        r"^Robert Bosch",
-        r"^ROBERT BOSCH",
-        r"^Via ",
-        r"^VIA ",
-        r"^Dati da indicare",
-        r"^Dest\.",
-        r"^Fattura presso",
-        r"^CL THERMOSERVICE",
-        r"^IT-\d+",
-        r"^Pagina ",
-        r"^Pos\s+Cod\.",
-        r"^Descrizione ",
-        r"^Cod\.EAN",
-        r"^Partita IVA",
-        r"^D\.d\.T\.",
-        r"^Vs\. ordine",
-        r"^del \d",
-        r"^Cessione ",
-        r"^Capitale ",
-        r"^C\.C\.I\.A\.A\.",
-        r"^Bollo ",
-        r"^Pile ",
-        r"^BOSCH ",
-        r"^\d+[,.]\d+$",
-        r"^\d{3,5}\s+",
-        r"^IVA ",
-        r"^IBAN",
-        r"^SWIFT",
-        r"^UniCredit",
-        r"^Ricevuta",
-        r"^Il documento",
-        r"^Per eventuali bonifici",
-        r"^INDICARE SEMPRE",
-        r"^IL RITARDATO",
-    ]
-
-    return any(re.search(pattern, value, re.IGNORECASE) for pattern in patterns)
-
-
-def is_bosch_description_line(line: str) -> bool:
-    value = normalize_spaces(line)
-
-    if not value:
-        return False
-
-    if is_noise_line(value):
-        return False
-
-    if re.search(r"^\d{3,5}\s+[0-9A-Z][0-9A-Z\-./]+", value, re.IGNORECASE):
-        return False
-
-    if re.search(r"^\d+(?:[.,]\d+)?$", value):
-        return False
-
-    return bool(re.search(r"[A-ZÀ-Ü]", value, re.IGNORECASE))
 
 
 def extract_products_section(text: str) -> str:
@@ -643,6 +743,12 @@ def is_bad_description(description: str) -> bool:
         r"dati aggiuntivi",
         r"riepilogo iva",
         r"calcolo fattura",
+        r"ricevuta",
+        r"bonifici",
+        r"iban",
+        r"swift",
+        r"totale",
+        r"iva vendite",
     ]
 
     return any(re.search(pattern, value, re.IGNORECASE) for pattern in bad)
@@ -652,7 +758,11 @@ def is_valid_material(item: Dict[str, Any]) -> bool:
     if item.get("skip"):
         return False
 
+    code = str(item.get("code", "") or "").strip()
     description = str(item.get("description", "") or "").strip()
+
+    if not code and not description:
+        return False
 
     if is_bad_description(description):
         return False

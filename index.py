@@ -43,6 +43,12 @@ class CreateUserPayload(BaseModel):
     companyId: str = ""
 
 
+class DeleteUserPayload(BaseModel):
+    uid: str = ""
+    email: str = ""
+    companyId: str = ""
+
+
 def normalize_role(role: str) -> str:
     value = str(role or "").strip().lower()
 
@@ -258,6 +264,84 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "status": "running"}
+
+
+
+
+@app.post("/api/admin/delete-user")
+async def admin_delete_user(payload: DeleteUserPayload, request: Request):
+    requester = await require_admin_user(request)
+
+    uid = str(payload.uid or "").strip()
+    email = str(payload.email or "").strip().lower()
+    company_id = str(payload.companyId or requester["companyId"] or "cl_thermoservice").strip()
+
+    if company_id != requester["companyId"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Non puoi eliminare utenti di un'azienda diversa dalla tua.",
+        )
+
+    if not uid and not email:
+        raise HTTPException(status_code=400, detail="UID o email obbligatori.")
+
+    get_firebase_admin_app()
+    db = get_firestore_client()
+
+    firebase_user = None
+
+    if uid:
+        try:
+            firebase_user = firebase_auth_admin.get_user(uid)
+        except firebase_auth_admin.UserNotFoundError:
+            firebase_user = None
+
+    if not firebase_user and email:
+        try:
+            firebase_user = firebase_auth_admin.get_user_by_email(email)
+        except firebase_auth_admin.UserNotFoundError:
+            firebase_user = None
+
+    deleted_auth = False
+    deleted_firestore = False
+
+    if firebase_user:
+        uid = firebase_user.uid
+
+        profile_ref = db.collection("users").document(uid)
+        profile_snap = profile_ref.get()
+
+        if profile_snap.exists:
+            profile = profile_snap.to_dict() or {}
+            profile_company_id = (
+                profile.get("companyId")
+                or profile.get("company_id")
+                or profile.get("company")
+                or company_id
+            )
+
+            if profile_company_id != requester["companyId"]:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Non puoi eliminare utenti di un'azienda diversa dalla tua.",
+                )
+
+            profile_ref.delete()
+            deleted_firestore = True
+
+        firebase_auth_admin.delete_user(uid)
+        deleted_auth = True
+
+    return JSONResponse(
+        content={
+            "ok": True,
+            "uid": uid,
+            "email": email,
+            "deletedAuth": deleted_auth,
+            "deletedFirestore": deleted_firestore,
+        },
+        headers=CORS_HEADERS,
+    )
 
 
 @app.post("/parse")

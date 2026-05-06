@@ -1,3 +1,5 @@
+import os
+import json
 import re
 import tempfile
 from typing import List, Dict, Any
@@ -5,9 +7,15 @@ from typing import List, Dict, Any
 import pdfplumber
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from parser_common import parse_italian_number, clean_description, deduplicate_items
 from parser_scan import build_scan_response
+
+
+import firebase_admin
+from firebase_admin import auth as firebase_auth_admin
+from firebase_admin import credentials, firestore
 
 
 app = FastAPI()
@@ -19,6 +27,196 @@ CORS_HEADERS = {
     "Access-Control-Expose-Headers": "*",
     "Access-Control-Max-Age": "86400",
 }
+
+
+# ============================================================
+# FIREBASE ADMIN - Creazione utenti da web app
+# ============================================================
+
+class CreateUserPayload(BaseModel):
+    email: str
+    password: str
+    fullName: str
+    role: str = "operaio"
+    active: bool = True
+    permissions: Dict[str, Any] = {}
+    companyId: str = ""
+
+
+def normalize_role(role: str) -> str:
+    value = str(role or "").strip().lower()
+
+    if value == "admin":
+        return "datore"
+    if value == "controllo":
+        return "datore"
+    if value == "segreteria":
+        return "segretaria"
+    if value == "operatore":
+        return "magazziniere"
+
+    return value or "operaio"
+
+
+def get_firebase_admin_app():
+    if firebase_admin._apps:
+        return firebase_admin.get_app()
+
+    raw_service_account = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+
+    if not raw_service_account:
+        raise HTTPException(
+            status_code=500,
+            detail="FIREBASE_SERVICE_ACCOUNT_JSON non configurato su Vercel.",
+        )
+
+    try:
+        service_account = json.loads(raw_service_account)
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="FIREBASE_SERVICE_ACCOUNT_JSON non è un JSON valido.",
+        )
+
+    cred = credentials.Certificate(service_account)
+    return firebase_admin.initialize_app(cred)
+
+
+def get_firestore_client():
+    get_firebase_admin_app()
+    return firestore.client()
+
+
+async def require_admin_user(request: Request) -> Dict[str, Any]:
+    auth_header = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token Firebase mancante.")
+
+    token = auth_header.replace("Bearer ", "", 1).strip()
+
+    try:
+        get_firebase_admin_app()
+        decoded = firebase_auth_admin.verify_id_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token Firebase non valido.")
+
+    requester_uid = decoded.get("uid")
+
+    if not requester_uid:
+        raise HTTPException(status_code=401, detail="UID richiedente mancante.")
+
+    db = get_firestore_client()
+    requester_ref = db.collection("users").document(requester_uid)
+    requester_snap = requester_ref.get()
+
+    if not requester_snap.exists:
+        raise HTTPException(status_code=403, detail="Profilo richiedente non trovato.")
+
+    requester = requester_snap.to_dict() or {}
+    requester_role = normalize_role(requester.get("role") or requester.get("ruolo"))
+    requester_active = bool(requester.get("active", requester.get("attivo", True)))
+
+    if not requester_active:
+        raise HTTPException(status_code=403, detail="Account richiedente non attivo.")
+
+    if requester_role not in ["datore", "admin"]:
+        raise HTTPException(status_code=403, detail="Solo il datore può creare utenti.")
+
+    company_id = (
+        requester.get("companyId")
+        or requester.get("company_id")
+        or requester.get("company")
+        or "cl_thermoservice"
+    )
+
+    return {
+        "uid": requester_uid,
+        "email": decoded.get("email", ""),
+        "companyId": company_id,
+        "role": requester_role,
+    }
+
+
+@app.post("/api/admin/create-user")
+async def admin_create_user(payload: CreateUserPayload, request: Request):
+    requester = await require_admin_user(request)
+
+    email = str(payload.email or "").strip().lower()
+    password = str(payload.password or "").strip()
+    full_name = str(payload.fullName or "").strip()
+    role = normalize_role(payload.role)
+    company_id = str(payload.companyId or requester["companyId"] or "cl_thermoservice").strip()
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Email obbligatoria.")
+
+    if not full_name:
+        raise HTTPException(status_code=400, detail="Nome completo obbligatorio.")
+
+    if not password or len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password obbligatoria, minimo 6 caratteri.")
+
+    if company_id != requester["companyId"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Non puoi creare utenti per un'azienda diversa dalla tua.",
+        )
+
+    get_firebase_admin_app()
+    db = get_firestore_client()
+
+    created_new_auth_user = False
+
+    try:
+        firebase_user = firebase_auth_admin.get_user_by_email(email)
+
+        firebase_auth_admin.update_user(
+            firebase_user.uid,
+            password=password,
+            display_name=full_name,
+            disabled=not payload.active,
+        )
+    except firebase_auth_admin.UserNotFoundError:
+        firebase_user = firebase_auth_admin.create_user(
+            email=email,
+            password=password,
+            display_name=full_name,
+            disabled=not payload.active,
+        )
+        created_new_auth_user = True
+
+    user_doc = {
+        "active": bool(payload.active),
+        "companyId": company_id,
+        "company_id": company_id,
+        "email": email,
+        "fullName": full_name,
+        "nome": full_name,
+        "role": role,
+        "ruolo": role,
+        "permissions": payload.permissions or {},
+        "permessi": payload.permissions or {},
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+
+    if created_new_auth_user:
+        user_doc["createdAt"] = firestore.SERVER_TIMESTAMP
+
+    db.collection("users").document(firebase_user.uid).set(user_doc, merge=True)
+
+    return JSONResponse(
+        content={
+            "ok": True,
+            "uid": firebase_user.uid,
+            "email": email,
+            "fullName": full_name,
+            "role": role,
+            "companyId": company_id,
+            "createdAuthUser": created_new_auth_user,
+        },
+        headers=CORS_HEADERS,
+    )
 
 
 @app.middleware("http")

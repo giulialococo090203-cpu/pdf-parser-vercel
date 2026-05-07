@@ -547,17 +547,92 @@ def detect_supplier_from_text(text: str) -> Dict[str, Any]:
     """
     Rileva il fornitore dal testo della fattura.
 
-    Strategia:
-    - riconoscimento diretto dei fornitori più comuni;
-    - altrimenti usa le prime righe del documento;
-    - evita dati del cliente CL THERMOSERVICE e righe tecniche.
+    Priorità:
+    1. Sezione FORNITORE nelle fatture elettroniche.
+    2. Alias/brand noti.
+    3. Intestazione/piè pagina documento.
     """
     normalized = normalize_pdf_text(text)
+    lines = [
+        normalize_spaces(line)
+        for line in str(normalized or "").split("\n")
+        if normalize_spaces(line)
+    ]
+
+    def is_bad_supplier_line(value: str) -> bool:
+        upper = normalize_spaces(value).upper()
+
+        bad_patterns = [
+            r"^CLIENTE$",
+            r"^DESTINATARIO$",
+            r"^PRODOTTI",
+            r"^SERVIZI",
+            r"^P\.?\s*IVA",
+            r"^C\.?F\.?",
+            r"^CODICE",
+            r"^VIA\b",
+            r"^\d{5}\b",
+            r"^IT\d+",
+            r"^CL\s+THERMOSERVICE",
+            r"THERMOSERVICE",
+            r"^FATTURA",
+            r"^NR\.?",
+            r"^DATA",
+            r"^PAGINA",
+        ]
+
+        return any(re.search(pattern, upper, re.IGNORECASE) for pattern in bad_patterns)
+
+    def clean_name(value: str) -> str:
+        cleaned = clean_supplier_name(value)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip(" -–—|,.;:")
+
+    # 1) Fatture elettroniche: FORNITORE -> riga successiva utile
+    for index, line in enumerate(lines[:80]):
+        if normalize_spaces(line).upper() == "FORNITORE":
+            for candidate in lines[index + 1 : index + 8]:
+                name = clean_name(candidate)
+
+                if not name:
+                    continue
+
+                if is_bad_supplier_line(name):
+                    continue
+
+                if len(name) < 3 or len(name) > 90:
+                    continue
+
+                return {
+                    "supplier": name,
+                    "confidence": "alta",
+                    "source": "section_fornitore",
+                }
+
+    # 2) Pattern FORNITORE Nome sulla stessa riga
+    joined = "\n".join(lines[:100])
+    same_line_patterns = [
+        r"FORNITORE\s+([A-ZÀ-ÿ0-9&.'’\-\s]{3,80})\s+(?:P\.?\s*IVA|C\.?F\.?|VIA|CLIENTE)",
+        r"FORNITORE\s*[:\-]\s*([A-ZÀ-ÿ0-9&.'’\-\s]{3,80})",
+    ]
+
+    for pattern in same_line_patterns:
+        match = re.search(pattern, joined, re.IGNORECASE)
+        if match:
+            name = clean_name(match.group(1))
+            if name and not is_bad_supplier_line(name):
+                return {
+                    "supplier": name,
+                    "confidence": "alta",
+                    "source": "fornitore_inline",
+                }
+
+    # 3) Alias noti / marca
     upper_text = normalized.upper()
 
     known_suppliers = [
         ("Robert Bosch S.p.A.", ["ROBERT BOSCH", "BOSCH"]),
-        ("Ariston S.p.A.", ["ARISTON"]),
+        ("Ariston SpA", ["ARISTON"]),
         ("Baxi S.p.A.", ["BAXI"]),
         ("Immergas S.p.A.", ["IMMERGAS"]),
         ("Ferroli S.p.A.", ["FERROLI"]),
@@ -584,58 +659,23 @@ def detect_supplier_from_text(text: str) -> Dict[str, Any]:
                     "source": f"known_alias:{alias}",
                 }
 
-    lines = [
-        normalize_spaces(line)
-        for line in str(text or "").split("\n")
-        if normalize_spaces(line)
-    ]
-
-    bad_patterns = [
-        r"^FATTURA",
-        r"^DOCUMENTO",
-        r"^DATA\b",
-        r"^NUMERO\b",
-        r"^PAGINA\b",
-        r"^CLIENTE\b",
-        r"^DESTINATARIO\b",
-        r"^SPETT\.?LE",
-        r"^CL\s+THERMOSERVICE",
-        r"THERMOSERVICE",
-        r"^VIA\b",
-        r"^P\.?\s*IVA",
-        r"^COD\.?\s*FISCALE",
-        r"^TEL\.?",
-        r"^EMAIL",
-        r"^PEC",
-        r"^IBAN",
-        r"^BANCA",
-        r"^WWW\.",
-        r"^HTTP",
-        r"^CAP\b",
-        r"^PRODOTTI",
-        r"^DESCRIZIONE",
-        r"^COD\.?",
-        r"^RIFERIMENTO",
-    ]
-
+    # 4) Intestazione/piè pagina con suffisso società
     legal_suffix = re.compile(
-        r"\b(S\.?R\.?L\.?|S\.?P\.?A\.?|S\.?A\.?S\.?|SNC|SRLS|GMBH|LTD)\b",
+        r"\b(S\.?R\.?L\.?|S\.?P\.?A\.?|S\.?A\.?S\.?|SNC|SRLS|GMBH|LTD|SPA|SRL)\b",
         re.IGNORECASE,
     )
 
     candidates = []
 
-    for index, line in enumerate(lines[:35]):
-        value = clean_supplier_name(line)
+    for index, line in enumerate(lines[:50]):
+        value = clean_name(line)
         if not value:
             continue
 
-        upper = value.upper()
-
-        if any(re.search(pattern, upper, re.IGNORECASE) for pattern in bad_patterns):
+        if is_bad_supplier_line(value):
             continue
 
-        if len(value) < 3 or len(value) > 80:
+        if len(value) < 3 or len(value) > 100:
             continue
 
         if re.fullmatch(r"[\d\s.,:/\-]+", value):
@@ -643,31 +683,26 @@ def detect_supplier_from_text(text: str) -> Dict[str, Any]:
 
         score = 0
 
-        if index <= 5:
-            score += 30
-        elif index <= 12:
-            score += 15
+        if index <= 8:
+            score += 25
+        elif index <= 20:
+            score += 10
 
         if legal_suffix.search(value):
             score += 35
 
-        if re.search(r"\b(ITALIA|GROUP|TERM|CLIMA|RICAMBI|CALDAIE|IDRAULICA|ELETTRICA|DISTRIBUZIONE)\b", upper):
-            score += 10
+        if re.search(r"\b(BOSCH|ARISTON|BAXI|IMMERGAS|FERROLI|VAILLANT|RIELLO|BERETTA)\b", value, re.IGNORECASE):
+            score += 40
 
-        words = [w for w in re.split(r"\s+", value) if w]
-        if 1 <= len(words) <= 6:
-            score += 10
-
-        if score >= 25:
+        if score >= 35:
             candidates.append((score, index, value))
 
     if candidates:
         candidates.sort(key=lambda item: (-item[0], item[1]))
-        best = clean_supplier_name(candidates[0][2])
         return {
-            "supplier": best,
+            "supplier": clean_name(candidates[0][2]),
             "confidence": "media",
-            "source": "header_candidate",
+            "source": "header_or_footer_candidate",
         }
 
     return {
@@ -676,13 +711,6 @@ def detect_supplier_from_text(text: str) -> Dict[str, Any]:
         "source": "not_detected",
     }
 
-
-# ============================================================
-# BOSCH CLASSICO
-# Formato:
-# 0010 8-718-641-615-0 1 56,45 -30,00%(c) -5,00%(d) 37,53 H6
-# descrizione nella riga successiva.
-# ============================================================
 
 def extract_bosch_classic_rows(text: str) -> List[Dict[str, Any]]:
     lines = [

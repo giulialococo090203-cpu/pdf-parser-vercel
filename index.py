@@ -498,6 +498,7 @@ def build_matrix(rows: List[Dict[str, Any]]) -> List[List[Any]]:
             "Marca",
             "Categoria",
             "Posizione",
+            "Fornitore",
         ],
         *[
             [
@@ -509,6 +510,7 @@ def build_matrix(rows: List[Dict[str, Any]]) -> List[List[Any]]:
                 row.get("brand", ""),
                 row.get("category", ""),
                 row.get("position", ""),
+                row.get("supplier", "") or row.get("fornitore", ""),
             ]
             for row in rows
         ],

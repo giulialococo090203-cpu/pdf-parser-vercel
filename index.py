@@ -373,8 +373,18 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
             }
             return JSONResponse(content=scan, headers=CORS_HEADERS)
 
+        supplier_info = detect_supplier_from_text(full_text)
+        supplier_name = supplier_info.get("supplier", "")
+
         rows = extract_invoice_rows(full_text)
         rows = deduplicate_items(rows)
+
+        if supplier_name:
+            for row in rows:
+                if not row.get("supplier"):
+                    row["supplier"] = supplier_name
+                if not row.get("brand") or str(row.get("brand", "")).strip().lower() in ["", "da assegnare"]:
+                    row["brand"] = row.get("brand") or supplier_name
 
         if not rows:
             payload = {
@@ -384,6 +394,10 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
                 "message": "Il PDF è stato letto, ma non sono state riconosciute righe articolo utilizzabili.",
                 "rows": [],
                 "matrix": [],
+                "supplier": supplier_name,
+                "fornitore": supplier_name,
+                "supplierConfidence": supplier_info.get("confidence", ""),
+                "supplierSource": supplier_info.get("source", ""),
                 "text": full_text,
                 "rawText": full_text,
                 "debug": {
@@ -399,6 +413,10 @@ async def parse_invoice_pdf(file: UploadFile = File(...)):
             "fileName": filename,
             "rows": rows,
             "matrix": build_matrix(rows),
+            "supplier": supplier_name,
+            "fornitore": supplier_name,
+            "supplierConfidence": supplier_info.get("confidence", ""),
+            "supplierSource": supplier_info.get("source", ""),
             "text": full_text,
             "rawText": full_text,
             "debug": {
@@ -511,6 +529,150 @@ def extract_invoice_rows(text: str) -> List[Dict[str, Any]]:
         return []
 
     return max(candidates, key=len)
+
+
+def clean_supplier_name(value: str) -> str:
+    text = normalize_spaces(value or "")
+
+    text = re.sub(r"\b(S\.?R\.?L\.?|S\.?P\.?A\.?|S\.?A\.?S\.?|SNC|SRLS|GMBH|LTD)\b\.?", lambda m: m.group(0).upper(), text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip(" -–—|,.;:")
+
+    return text.strip()
+
+
+def detect_supplier_from_text(text: str) -> Dict[str, Any]:
+    """
+    Rileva il fornitore dal testo della fattura.
+
+    Strategia:
+    - riconoscimento diretto dei fornitori più comuni;
+    - altrimenti usa le prime righe del documento;
+    - evita dati del cliente CL THERMOSERVICE e righe tecniche.
+    """
+    normalized = normalize_pdf_text(text)
+    upper_text = normalized.upper()
+
+    known_suppliers = [
+        ("Robert Bosch S.p.A.", ["ROBERT BOSCH", "BOSCH"]),
+        ("Ariston S.p.A.", ["ARISTON"]),
+        ("Baxi S.p.A.", ["BAXI"]),
+        ("Immergas S.p.A.", ["IMMERGAS"]),
+        ("Ferroli S.p.A.", ["FERROLI"]),
+        ("Vaillant Group Italia S.p.A.", ["VAILLANT"]),
+        ("Viessmann S.r.l.", ["VIESSMANN"]),
+        ("Caleffi S.p.A.", ["CALEFFI"]),
+        ("Cordivari S.r.l.", ["CORDIVARI"]),
+        ("Fondital S.p.A.", ["FONDITAL"]),
+        ("Riello S.p.A.", ["RIELLO"]),
+        ("Beretta", ["BERETTA"]),
+        ("Daikin Air Conditioning Italy S.p.A.", ["DAIKIN"]),
+        ("Mitsubishi Electric", ["MITSUBISHI"]),
+        ("Samsung Electronics", ["SAMSUNG"]),
+        ("LG Electronics", ["LG ELECTRONICS"]),
+        ("Panasonic", ["PANASONIC"]),
+    ]
+
+    for supplier_name, aliases in known_suppliers:
+        for alias in aliases:
+            if alias in upper_text:
+                return {
+                    "supplier": supplier_name,
+                    "confidence": "alta",
+                    "source": f"known_alias:{alias}",
+                }
+
+    lines = [
+        normalize_spaces(line)
+        for line in str(text or "").split("\n")
+        if normalize_spaces(line)
+    ]
+
+    bad_patterns = [
+        r"^FATTURA",
+        r"^DOCUMENTO",
+        r"^DATA\b",
+        r"^NUMERO\b",
+        r"^PAGINA\b",
+        r"^CLIENTE\b",
+        r"^DESTINATARIO\b",
+        r"^SPETT\.?LE",
+        r"^CL\s+THERMOSERVICE",
+        r"THERMOSERVICE",
+        r"^VIA\b",
+        r"^P\.?\s*IVA",
+        r"^COD\.?\s*FISCALE",
+        r"^TEL\.?",
+        r"^EMAIL",
+        r"^PEC",
+        r"^IBAN",
+        r"^BANCA",
+        r"^WWW\.",
+        r"^HTTP",
+        r"^CAP\b",
+        r"^PRODOTTI",
+        r"^DESCRIZIONE",
+        r"^COD\.?",
+        r"^RIFERIMENTO",
+    ]
+
+    legal_suffix = re.compile(
+        r"\b(S\.?R\.?L\.?|S\.?P\.?A\.?|S\.?A\.?S\.?|SNC|SRLS|GMBH|LTD)\b",
+        re.IGNORECASE,
+    )
+
+    candidates = []
+
+    for index, line in enumerate(lines[:35]):
+        value = clean_supplier_name(line)
+        if not value:
+            continue
+
+        upper = value.upper()
+
+        if any(re.search(pattern, upper, re.IGNORECASE) for pattern in bad_patterns):
+            continue
+
+        if len(value) < 3 or len(value) > 80:
+            continue
+
+        if re.fullmatch(r"[\d\s.,:/\-]+", value):
+            continue
+
+        score = 0
+
+        if index <= 5:
+            score += 30
+        elif index <= 12:
+            score += 15
+
+        if legal_suffix.search(value):
+            score += 35
+
+        if re.search(r"\b(ITALIA|GROUP|TERM|CLIMA|RICAMBI|CALDAIE|IDRAULICA|ELETTRICA|DISTRIBUZIONE)\b", upper):
+            score += 10
+
+        words = [w for w in re.split(r"\s+", value) if w]
+        if 1 <= len(words) <= 6:
+            score += 10
+
+        if score >= 25:
+            candidates.append((score, index, value))
+
+    if candidates:
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        best = clean_supplier_name(candidates[0][2])
+        return {
+            "supplier": best,
+            "confidence": "media",
+            "source": "header_candidate",
+        }
+
+    return {
+        "supplier": "",
+        "confidence": "nessuna",
+        "source": "not_detected",
+    }
 
 
 # ============================================================

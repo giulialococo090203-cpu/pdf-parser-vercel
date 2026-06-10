@@ -7,6 +7,7 @@ from typing import List, Dict, Any
 import pdfplumber
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from parser_common import parse_italian_number, clean_description, deduplicate_items
@@ -20,14 +21,31 @@ from firebase_admin import credentials, firestore
 
 app = FastAPI()
 
+ALLOWED_ORIGINS = [
+    "https://magazzino-pro.vercel.app",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
+)
+
 CORS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": "https://magazzino-pro.vercel.app",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "*",
     "Access-Control-Expose-Headers": "*",
     "Access-Control-Max-Age": "86400",
 }
-
 
 # ============================================================
 # FIREBASE ADMIN - Creazione utenti da web app
@@ -225,31 +243,43 @@ async def admin_create_user(payload: CreateUserPayload, request: Request):
     )
 
 
+def build_cors_headers(request: Request) -> Dict[str, str]:
+    origin = request.headers.get("origin") or request.headers.get("Origin") or ""
+
+    allowed_origin = origin if origin in ALLOWED_ORIGINS else "https://magazzino-pro.vercel.app"
+
+    return {
+        "Access-Control-Allow-Origin": allowed_origin,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "*",
+        "Access-Control-Max-Age": "86400",
+    }
+
+
 @app.middleware("http")
 async def force_cors_headers(request: Request, call_next):
     if request.method == "OPTIONS":
         return JSONResponse(
             content={"ok": True},
             status_code=200,
-            headers=CORS_HEADERS,
+            headers=build_cors_headers(request),
         )
 
     response = await call_next(request)
 
-    for key, value in CORS_HEADERS.items():
+    for key, value in build_cors_headers(request).items():
         response.headers[key] = value
 
     return response
-
 
 @app.options("/{full_path:path}")
 async def preflight_handler(full_path: str, request: Request):
     return JSONResponse(
         content={"ok": True},
         status_code=200,
-        headers=CORS_HEADERS,
+        headers=build_cors_headers(request),
     )
-
 
 @app.get("/")
 def root():
